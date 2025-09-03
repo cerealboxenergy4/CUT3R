@@ -537,7 +537,7 @@ class ARCroco3DStereo(CroCoNet):
 
     def _encode_state(self, image_tokens, image_pos):
         batch_size = image_tokens.shape[0]
-        state_feat = self.register_tokens(
+        state_feat = self.register_tokens(  # (S, embed)
             torch.arange(self.state_size, device=image_pos.device)
         )
         if self.state_pe == "1d":
@@ -564,7 +564,7 @@ class ARCroco3DStereo(CroCoNet):
             )
         elif self.state_pe == "none":
             state_pos = None
-        state_feat = state_feat[None].expand(batch_size, -1, -1)
+        state_feat = state_feat[None].expand(batch_size, -1, -1)  # (B, S, Embed)
         return state_feat, state_pos, None
 
     def _encode_views(self, views, img_mask=None, ray_mask=None):
@@ -709,7 +709,7 @@ class ARCroco3DStereo(CroCoNet):
         Current Version: input the first frame img feature and pose to initialize the state feature and pose
         """
         state_feat, state_pos, _ = self._encode_state(image_tokens, image_pos)
-        state_feat = self.decoder_embed_state(state_feat)
+        state_feat = self.decoder_embed_state(state_feat)       # (B, S, Embed) -> (B, S, Encoded) (768 -> 768)
         return state_feat, state_pos
 
     def _recurrent_rollout(
@@ -822,7 +822,9 @@ class ARCroco3DStereo(CroCoNet):
         mem = self.pose_retriever.mem.expand(feat[0].shape[0], -1, -1)
         init_state_feat = state_feat.clone()
         init_mem = mem.clone()
-        all_state_args = [(state_feat, state_pos, init_state_feat, mem, init_mem)]
+        all_state_args = [
+            (state_feat, state_pos, init_state_feat, mem, init_mem)
+        ]  # 이미지 추가되면서 변하는 state 스냅샷 리스트
         ress = []
         for i in range(len(views)):
             feat_i = feat[i]
@@ -873,9 +875,9 @@ class ARCroco3DStereo(CroCoNet):
             else:
                 update_mask = img_mask
             update_mask = update_mask[:, None, None].float()
-            state_feat = new_state_feat * update_mask + state_feat * (  # state_feat = new state_feat iff update_mask = 1 
+            state_feat = new_state_feat * update_mask + state_feat * (
                 1 - update_mask
-            )  # update global state
+            )  # state_feat = new state_feat iff update_mask = 1  # update global state
             mem = new_mem * update_mask + mem * (
                 1 - update_mask
             )  # then update local state

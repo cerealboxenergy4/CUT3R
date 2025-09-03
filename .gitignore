@@ -61,5 +61,9 @@ src/checkpoints
 *.jpeg
 
 
-#checkpoints
+# checkpoints
 *.pth
+
+
+# personal experiments
+experiments/

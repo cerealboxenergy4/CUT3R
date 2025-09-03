@@ -108,7 +108,7 @@ def prepare_input(
         for i in range(len(images)):
             view = {
                 "img": images[i]["img"],
-                "ray_map": torch.full(          # (1, 6, H, W) tensor filled with NaN (6 = 3dim origin + 3dim direction of ray)
+                "ray_map": torch.full(  # (1, 6, H, W) tensor filled with NaN (6 = 3dim origin + 3dim direction of ray)
                     (
                         images[i]["img"].shape[0],
                         6,
@@ -198,7 +198,7 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True):
     Returns:
         tuple: (points, colors, confidence, camera parameters dictionary)
     """
-    
+
     from src.dust3r.utils.camera import pose_encoding_to_camera
     from src.dust3r.post_process import estimate_focal_knowing_depth
     from src.dust3r.utils.geometry import geotrf
@@ -379,6 +379,26 @@ def run_inference(args):
         f"Inference completed in {total_time:.2f} seconds (average {per_frame_time:.2f} s per frame)."
     )
 
+    # state features 단계별 시각화
+    from pathlib import Path
+    import re
+    
+    state_features = np.stack(
+        [sa[0].detach().cpu().numpy() for sa in state_args], axis=0  # 각 시점의 (B,S,D)
+    )
+
+    dir = "experiments/state_per_frame"
+    os.makedirs(dir, exist_ok=True)
+    seq = Path(args.seq_path)
+
+    # 디렉터리 경로든 파일 경로든 마지막 이름만 사용
+    seq_id = seq.stem if seq.suffix else seq.name          # 예: 'house_1x_2fps'
+
+    # 파일명 안전화(슬래시/공백 등 제거)
+    seq_id = re.sub(r'[^A-Za-z0-9._-]+', '_', seq_id)
+    np.save(f"experiments/state_per_frame/test_{seq_id}.npy", state_features)
+    print("State tensor saved to:", os.listdir(dir))
+
     # Process outputs for visualization.
     print("Preparing output for visualization...")
     pts3ds_other, colors, conf, cam_dict = prepare_output(
@@ -403,7 +423,7 @@ def run_inference(args):
         edge_color_list=edge_colors,
         show_camera=True,
         vis_threshold=args.vis_threshold,
-        size = args.size
+        size=args.size,
     )
     viewer.run()
 
