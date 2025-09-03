@@ -59,3 +59,7 @@ src/checkpoints
 *.mp4
 *.MOV
 *.jpeg
+
+
+#checkpoints
+*.pth
