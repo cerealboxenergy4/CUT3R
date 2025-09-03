@@ -18,6 +18,7 @@ Official implementation of <strong>Continuous 3D Perception Model with Persisten
 (*: equal contribution)
 
 <div style="line-height: 1;">
+
   <a href="https://cut3r.github.io/" target="_blank" style="margin: 2px;">
     <img alt="Website" src="https://img.shields.io/badge/Website-CUT3R-536af5?color=536af5&logoColor=white" style="display: inline-block; vertical-align: middle;"/>
   </a>

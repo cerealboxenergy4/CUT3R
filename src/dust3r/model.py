@@ -161,7 +161,7 @@ class LocalMemory(nn.Module):
         self.masked_token = nn.Parameter(
             torch.randn(1, 1, v_dim) * 0.2, requires_grad=True
         )
-        self.mem = nn.Parameter(
+        self.mem = nn.Parameter(  # 메모리 텐서
             torch.randn(1, size, 2 * v_dim) * 0.2, requires_grad=True
         )
         self.write_blocks = nn.ModuleList(
@@ -665,8 +665,10 @@ class ARCroco3DStereo(CroCoNet):
             assert f_pose is not None and pos_pose is not None
             f_img = torch.cat([f_pose, f_img], dim=1)
             pos_img = torch.cat([pos_pose, pos_img], dim=1)
-        final_output.append((f_state, f_img))
-        for blk_state, blk_img in zip(self.dec_blocks_state, self.dec_blocks):
+        final_output.append((f_state, f_img))  # embedding한 f_img가 final_output[1]
+        for blk_state, blk_img in zip(
+            self.dec_blocks_state, self.dec_blocks
+        ):  # decoder block depth만큼 반복
             if (
                 self.gradient_checkpointing
                 and self.training
@@ -674,14 +676,14 @@ class ARCroco3DStereo(CroCoNet):
             ):
                 f_state, _ = checkpoint(
                     blk_state,
-                    *final_output[-1][::+1],
+                    *final_output[-1][::+1],  # f_state, f_img
                     pos_state,
                     pos_img,
                     use_reentrant=not self.fixed_input_length,
                 )
                 f_img, _ = checkpoint(
                     blk_img,
-                    *final_output[-1][::-1],
+                    *final_output[-1][::-1],  # f_img, f_state
                     pos_img,
                     pos_state,
                     use_reentrant=not self.fixed_input_length,
@@ -689,13 +691,13 @@ class ARCroco3DStereo(CroCoNet):
             else:
                 f_state, _ = blk_state(*final_output[-1][::+1], pos_state, pos_img)
                 f_img, _ = blk_img(*final_output[-1][::-1], pos_img, pos_state)
-            final_output.append((f_state, f_img))
-        del final_output[1]  # duplicate with final_output[0]
+            final_output.append((f_state, f_img))  # depth개만큼 튜플 추가
+        del final_output[1]  # duplicate with final_output[0] 과도기 항목 제거
         final_output[-1] = (
             self.dec_norm_state(final_output[-1][0]),
-            self.dec_norm(final_output[-1][1]),
+            self.dec_norm(final_output[-1][1]),  # 마지막 D단계 정규화
         )
-        return zip(*final_output)
+        return zip(*final_output)  # [(0~D단계 f_state), (0~D단계 f_img)]
 
     def _downstream_head(self, decout, img_shape, **kwargs):
         B, S, D = decout[-1].shape
@@ -871,7 +873,7 @@ class ARCroco3DStereo(CroCoNet):
             else:
                 update_mask = img_mask
             update_mask = update_mask[:, None, None].float()
-            state_feat = new_state_feat * update_mask + state_feat * (
+            state_feat = new_state_feat * update_mask + state_feat * (  # state_feat = new state_feat iff update_mask = 1 
                 1 - update_mask
             )  # update global state
             mem = new_mem * update_mask + mem * (

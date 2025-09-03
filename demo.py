@@ -108,7 +108,7 @@ def prepare_input(
         for i in range(len(images)):
             view = {
                 "img": images[i]["img"],
-                "ray_map": torch.full(
+                "ray_map": torch.full(          # (1, 6, H, W) tensor filled with NaN (6 = 3dim origin + 3dim direction of ray)
                     (
                         images[i]["img"].shape[0],
                         6,
@@ -198,6 +198,7 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True):
     Returns:
         tuple: (points, colors, confidence, camera parameters dictionary)
     """
+    
     from src.dust3r.utils.camera import pose_encoding_to_camera
     from src.dust3r.post_process import estimate_focal_knowing_depth
     from src.dust3r.utils.geometry import geotrf
