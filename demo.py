@@ -353,13 +353,17 @@ def run_inference(args):
     img_mask = [True] * len(img_paths)
 
     # Prepare input views.
+
+    revisit = 1
+    is_reccurent = True
+
     print("Preparing input views...")
     views = prepare_input(
         img_paths=img_paths,
         img_mask=img_mask,
         size=args.size,
-        revisit=1,
-        update=True,
+        revisit=revisit,
+        update=False,
     )
     if tmpdirname is not None:
         shutil.rmtree(tmpdirname)
@@ -372,7 +376,12 @@ def run_inference(args):
     # Run inference.
     print("Running inference...")
     start_time = time.time()
-    outputs, state_args = inference(views, model, device)
+    
+    if is_reccurent:
+        outputs, state_args = inference_recurrent(views, model, device)
+    else:
+        outputs, state_args = inference(views, model, device)
+
     total_time = time.time() - start_time
     per_frame_time = total_time / len(views)
     print(
@@ -382,7 +391,7 @@ def run_inference(args):
     # state features 단계별 시각화
     from pathlib import Path
     import re
-    
+
     state_features = np.stack(
         [sa[0].detach().cpu().numpy() for sa in state_args], axis=0  # 각 시점의 (B,S,D)
     )
@@ -402,7 +411,7 @@ def run_inference(args):
     # Process outputs for visualization.
     print("Preparing output for visualization...")
     pts3ds_other, colors, conf, cam_dict = prepare_output(
-        outputs, args.output_dir, 1, True
+        outputs, args.output_dir, revisit, True
     )
 
     # Convert tensors to numpy arrays for visualization.

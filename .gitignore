@@ -54,16 +54,10 @@ docs/_build/
 data
 src/checkpoints
 
-
 # videos
 *.mp4
 *.MOV
 *.jpeg
-
-
-# checkpoints
-*.pth
-
 
 # personal experiments
 experiments/
