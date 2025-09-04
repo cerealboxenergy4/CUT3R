@@ -63,3 +63,4 @@ src/checkpoints
 # personal experiments
 experiments/
 demo_tmp/
+tmp/
