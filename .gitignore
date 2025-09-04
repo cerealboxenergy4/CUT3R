@@ -58,6 +58,7 @@ src/checkpoints
 *.mp4
 *.MOV
 *.jpeg
+*.npy
 
 # personal experiments
 experiments/
