@@ -1,10 +1,9 @@
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-
-import numpy as np
-import matplotlib.pyplot as plt
 import os
+import seaborn as sns
+import pandas as pd
 
 
 def show_heatmap(arr, save_path=None, title=None):
@@ -20,7 +19,7 @@ def show_heatmap(arr, save_path=None, title=None):
     except ImportError:
         pass
 
-    assert arr.shape == (768, 768), f"Expected (768,768), got {arr.shape}"
+    # assert arr.shape == (768, 768), f"Expected (768,768), got {arr.shape}"
 
     plt.figure(figsize=(6, 6))  # 정사각 화면
     im = plt.imshow(
@@ -45,7 +44,9 @@ def show_heatmap(arr, save_path=None, title=None):
     plt.close()
 
 
-npypath = "/media/genchiprofac/Projects/CUT3R/experiments/state_per_frame/test_round1f_20.npy"
+npypath = (
+    "/media/genchiprofac/Projects/CUT3R/experiments/state_per_frame/test_house_1x_2fps.npy"
+)
 dir = npypath[:-4]
 os.makedirs(dir, exist_ok=True)
 
@@ -66,3 +67,52 @@ for i in range(states.shape[0] // 10):
 # plt.ylabel("sum of state token entries")
 # plt.tight_layout()
 # plt.savefig(dir + "/states.png")
+
+# infos_minus = []
+# for i in range(states.shape[0]):
+#     state = np.abs(states[i])
+#     print("state shape: "+ str(state.shape))
+#     state_sum = state.sum()
+#     column_sums = np.sum(state, axis=0)
+#     column_sums.sort()
+#     print(column_sums)
+#     state_sum_minus = np.sum(column_sums[:-10])
+#     infos_minus.append(state_sum_minus)
+#     print("total sum of info: " + str(state_sum), ", neglecting top n: " + str(state_sum_minus))
+
+# plt.plot(np.arange(len(infos_minus)), infos_minus)
+# plt.xlabel("image #")
+# plt.ylabel("sum of state token entries")
+# plt.tight_layout()
+# plt.savefig(dir + "/states_adjusted.png")
+
+state_norms = []
+for i in range(states.shape[0] // 10):
+    step = i * 10
+    state = states[step]
+    norms = np.linalg.norm(state, axis=1)  # (768,)
+    state_norms.append(norms)
+
+state_norms = np.array(state_norms)
+# long-form으로 변환
+df = pd.DataFrame(
+    {
+        "x": np.repeat(10 * np.arange(state_norms.shape[0]), state_norms.shape[1]),
+        "y": state_norms.flatten(),
+    }
+)
+plt.figure(figsize=(10, 6))
+plot = sns.violinplot(
+    data=df,
+    x="x",
+    y="y",
+    scale="width",
+    inner="quartile",
+    linewidth=0.8,
+)
+plt.tight_layout()
+plt.title("Norm distribution of state tokens by sequence step")
+plt.xlabel("image step")
+plt.ylabel("norm of state token")
+plt.tight_layout()
+plt.savefig(dir + "/state_norm_vplot.png")

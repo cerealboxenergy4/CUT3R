@@ -91,6 +91,10 @@ def load_model(model_path, device, verbose=True):
         print(s)
     return net.to(device)
 
+def slim_copy(alpha):
+        with torch.no_grad():
+            a = alpha.detach().mean(1).to(torch.float16).cpu()  # [B,Sq,Sk] → FP16 CPU
+        return a
 
 class ARCroco3DStereoConfig(PretrainedConfig):
     model_type = "arcroco_3d_stereo"
@@ -301,6 +305,10 @@ class ARCroco3DStereo(CroCoNet):
             **self.croco_args,
         )
         self.set_freeze(config.freeze)
+
+        # added for attention map visualization
+        self.collect_attention = False
+        self.attn_dump_seq = None
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kw):
@@ -655,7 +663,7 @@ class ARCroco3DStereo(CroCoNet):
             shapes.chunk(len(views), dim=0),
             [out.chunk(len(views), dim=0) for out in full_out],
             full_pos.chunk(len(views), dim=0),
-        )
+        )    
 
     def _decoder(self, f_state, pos_state, f_img, pos_img, f_pose, pos_pose):
         final_output = [(f_state, f_img)]  # before projection
@@ -665,6 +673,18 @@ class ARCroco3DStereo(CroCoNet):
             assert f_pose is not None and pos_pose is not None
             f_img = torch.cat([f_pose, f_img], dim=1)
             pos_img = torch.cat([pos_pose, pos_img], dim=1)
+
+        # --- NEW: init dump lists if collecting ---
+        if self.collect_attention:
+            dump = {
+                "state": {"self": [], "cross": []},
+                "img": {"self": [], "cross": []},
+            }
+            # 모든 디코더 블럭의 Attention/CrossAttention에 collect 켜주기
+            for m in list(self.dec_blocks_state) + list(self.dec_blocks):
+                m.attn.collect_attention = True
+                m.cross_attn.collect_attention = True
+
         final_output.append((f_state, f_img))  # embedding한 f_img가 final_output[1]
         for blk_state, blk_img in zip(
             self.dec_blocks_state, self.dec_blocks
@@ -691,12 +711,35 @@ class ARCroco3DStereo(CroCoNet):
             else:
                 f_state, _ = blk_state(*final_output[-1][::+1], pos_state, pos_img)
                 f_img, _ = blk_img(*final_output[-1][::-1], pos_img, pos_state)
+
+            # --- NEW: collect α after each block ---
+            if self.collect_attention:
+                dump["state"]["self"].append(
+                    slim_copy(blk_state.attn.last_alpha)
+                )  # [B,H,S,S]
+                dump["state"]["cross"].append(
+                    slim_copy(blk_state.cross_attn.last_alpha)  # [B, H, S_state, S_img]
+                )
+                dump["img"]["self"].append(slim_copy(blk_img.attn.last_alpha))  # [B,H,S_img,S_img]
+                dump["img"]["cross"].append(
+                    slim_copy(blk_img.cross_attn.last_alpha)  # [B,H,S_img,S_state]
+                )
+
             final_output.append((f_state, f_img))  # depth개만큼 튜플 추가
         del final_output[1]  # duplicate with final_output[0] 과도기 항목 제거
         final_output[-1] = (
             self.dec_norm_state(final_output[-1][0]),
             self.dec_norm(final_output[-1][1]),  # 마지막 D단계 정규화
         )
+
+        # --- NEW: store to model for later access ---
+        if self.collect_attention:
+            self.attn_dump_seq.append(dump)
+            # 시각화 모드 끝났으면 스위치 끄기 원하면 여기서 False로 돌려도 됨
+            # for m in list(self.dec_blocks_state) + list(self.dec_blocks):
+            #     m.attn.collect_attention = False
+            #     m.cross_attn.collect_attention = False
+
         return zip(*final_output)  # [(0~D단계 f_state), (0~D단계 f_img)]
 
     def _downstream_head(self, decout, img_shape, **kwargs):
@@ -709,7 +752,9 @@ class ARCroco3DStereo(CroCoNet):
         Current Version: input the first frame img feature and pose to initialize the state feature and pose
         """
         state_feat, state_pos, _ = self._encode_state(image_tokens, image_pos)
-        state_feat = self.decoder_embed_state(state_feat)       # (B, S, Embed) -> (B, S, Encoded) (768 -> 768)
+        state_feat = self.decoder_embed_state(
+            state_feat
+        )  # (B, S, Embed) -> (B, S, Encoded) (768 -> 768)
         return state_feat, state_pos
 
     def _recurrent_rollout(
@@ -816,6 +861,10 @@ class ARCroco3DStereo(CroCoNet):
         return res, (state_feat, mem)
 
     def _forward_impl(self, views, ret_state=False):
+        # initialize attention sequence if collect_attention is True
+        if self.collect_attention is True:
+            self.attn_dump_seq = []
+
         shape, feat_ls, pos = self._encode_views(views)
         feat = feat_ls[-1]
         state_feat, state_pos = self._init_state(feat[0], pos[0])

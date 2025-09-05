@@ -80,7 +80,7 @@ def parse_args():
 
 
 def prepare_input(
-    img_paths, img_mask, size, raymaps=None, raymap_mask=None, revisit=1, update=True
+    img_paths, img_mask, size, start=None, raymaps=None, raymap_mask=None, revisit=1, update=True
 ):
     """
     Prepare input views for inference from a list of image paths.
@@ -102,6 +102,8 @@ def prepare_input(
 
     images = load_images(img_paths, size=size)
     views = []
+    if start is not None:
+        images = images[start:]
 
     if raymaps is None and raymap_mask is None:
         # Only images are provided.
@@ -355,12 +357,15 @@ def run_inference(args):
     # Prepare input views.
 
     revisit = 1
-    is_reccurent = True
+    is_reccurent = False
+    image_start_index = None
+    collect_attention = True
 
     print("Preparing input views...")
     views = prepare_input(
         img_paths=img_paths,
         img_mask=img_mask,
+        start=image_start_index,
         size=args.size,
         revisit=revisit,
         update=False,
@@ -372,15 +377,21 @@ def run_inference(args):
     print(f"Loading model from {args.model_path}...")
     model = ARCroco3DStereo.from_pretrained(args.model_path).to(device)
     model.eval()
+    if collect_attention:
+        model.collect_attention = True
+        model.gradient_checkpointing = False
 
     # Run inference.
     print("Running inference...")
     start_time = time.time()
-    
+
     if is_reccurent:
         outputs, state_args = inference_recurrent(views, model, device)
     else:
-        outputs, state_args = inference(views, model, device)
+        if collect_attention:       # get attention dump for attention visualization
+            outputs, state_args, attnseq = inference(views, model, device, collect=collect_attention)
+        else:
+            outputs, state_args= inference(views, model, device)
 
     total_time = time.time() - start_time
     per_frame_time = total_time / len(views)
@@ -388,7 +399,7 @@ def run_inference(args):
         f"Inference completed in {total_time:.2f} seconds (average {per_frame_time:.2f} s per frame)."
     )
 
-    # state features 단계별 시각화
+    # 단계별 state features 저장
     from pathlib import Path
     import re
 
@@ -408,6 +419,12 @@ def run_inference(args):
     np.save(f"experiments/state_per_frame/test_{seq_id}.npy", state_features)
     print("State tensor saved to:", os.listdir(dir))
 
+    if collect_attention:
+        # attention dump 저장
+        dir_att = "experiments/attentions"
+        os.makedirs(dir_att, exist_ok=True)
+        torch.save(attnseq, dir_att + f"/{seq_id}_attn_seq.pt")
+        
     # Process outputs for visualization.
     print("Preparing output for visualization...")
     pts3ds_other, colors, conf, cam_dict = prepare_output(
@@ -436,12 +453,15 @@ def run_inference(args):
     )
     viewer.run()
 
+def attn_hook():
+    
+    ...
 
 def main():
     args = parse_args()
     if not args.seq_path:
         print(
-            "No inputs found! Please use our gradio demo if you would like to iteractively upload inputs."
+            "No inputs found! Please use our gradio demo if you would like to interactively upload inputs."
         )
         return
     else:
