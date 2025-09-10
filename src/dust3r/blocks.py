@@ -534,7 +534,7 @@ if __name__ == "__main__":
                     4,
                     qkv_bias=True,
                     norm_layer=partial(nn.LayerNorm, eps=1e-6),
-                    rope=RoPE2D(100),
+                    rope=None, #RoPE2D(100)
                 )
                 for _ in range(2)
             ]

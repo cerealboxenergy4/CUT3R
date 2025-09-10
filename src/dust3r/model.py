@@ -76,6 +76,8 @@ def load_model(model_path, device, verbose=True):
     args = ckpt["args"].model.replace(
         "ManyAR_PatchEmbed", "PatchEmbedDust3R"
     )  # ManyAR only for aspect ratio not consistent
+
+
     if "landscape_only" not in args:
         args = args[:-2] + ", landscape_only=False))"
     else:
@@ -91,9 +93,9 @@ def load_model(model_path, device, verbose=True):
         print(s)
     return net.to(device)
 
-def slim_copy(alpha):
+def slim_copy(alpha, mean_over=1):
         with torch.no_grad():
-            a = alpha.detach().mean(1).to(torch.float16).cpu()  # [B,Sq,Sk] → FP16 CPU
+            a = alpha.detach().mean(mean_over).to(torch.float16).cpu()  # [B,Sq,Sk] → FP16 CPU
         return a
 
 class ARCroco3DStereoConfig(PretrainedConfig):

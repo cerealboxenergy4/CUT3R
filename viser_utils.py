@@ -400,7 +400,7 @@ class PointCloudViewer:
             min=0.0001,
             max=0.1,
             step=0.0001,
-            initial_value=0.005,
+            initial_value=0.0002,
         )
         self.camsize_slider = self.server.add_gui_slider(
             "Camera Size",

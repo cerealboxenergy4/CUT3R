@@ -76,11 +76,18 @@ def parse_args():
         help="value for tempfile.tempdir",
     )
 
+    parser.add_argument(
+        "--revisit",
+        type=int,
+        default="1",
+        help="number of revisits during inference",
+    )
+
     return parser.parse_args()
 
 
 def prepare_input(
-    img_paths, img_mask, size, start=None, raymaps=None, raymap_mask=None, revisit=1, update=True
+    img_paths, img_mask, size, start=None, end=None, raymaps=None, raymap_mask=None, revisit=1, update=True
 ):
     """
     Prepare input views for inference from a list of image paths.
@@ -103,7 +110,14 @@ def prepare_input(
     images = load_images(img_paths, size=size)
     views = []
     if start is not None:
-        images = images[start:]
+        if end is not None:
+            images = images[start:end+1]
+        else: 
+            images = images[start:]
+    else:
+        if end is not None:
+            images = images[:end+1]
+    
 
     if raymaps is None and raymap_mask is None:
         # Only images are provided.
@@ -356,9 +370,11 @@ def run_inference(args):
 
     # Prepare input views.
 
-    revisit = 1
+    revisit = args.revisit
+    revisit_update = False
     is_reccurent = False
-    image_start_index = None
+    image_start_index = 0  # index starts from 0
+    image_end_index = 20
     collect_attention = True
 
     print("Preparing input views...")
@@ -366,9 +382,10 @@ def run_inference(args):
         img_paths=img_paths,
         img_mask=img_mask,
         start=image_start_index,
+        end = image_end_index,
         size=args.size,
         revisit=revisit,
-        update=False,
+        update=revisit_update,
     )
     if tmpdirname is not None:
         shutil.rmtree(tmpdirname)
@@ -424,12 +441,12 @@ def run_inference(args):
         dir_att = "experiments/attentions"
         os.makedirs(dir_att, exist_ok=True)
         torch.save(attnseq, dir_att + f"/{seq_id}_attn_seq.pt")
-        
+
     # Process outputs for visualization.
     print("Preparing output for visualization...")
     pts3ds_other, colors, conf, cam_dict = prepare_output(
         outputs, args.output_dir, revisit, True
-    )
+    )   # set revisit(3rd argument) to 1 to visualize before / after revisit simultaneously, else set to revisit 
 
     # Convert tensors to numpy arrays for visualization.
     pts3ds_to_vis = [p.cpu().numpy() for p in pts3ds_other]

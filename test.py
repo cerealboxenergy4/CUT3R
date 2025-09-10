@@ -21,7 +21,7 @@ def show_heatmap(arr, save_path=None, title=None):
 
     # assert arr.shape == (768, 768), f"Expected (768,768), got {arr.shape}"
 
-    plt.figure(figsize=(6, 6))  # 정사각 화면
+    plt.figure(figsize=(6, 8))  
     im = plt.imshow(
         arr,
         origin="lower",
@@ -45,7 +45,7 @@ def show_heatmap(arr, save_path=None, title=None):
 
 
 npypath = (
-    "/media/genchiprofac/Projects/CUT3R/experiments/state_per_frame/test_house_1x_2fps.npy"
+    "/media/genchiprofac/Projects/CUT3R/experiments/state_per_frame/test_chimera.npy"
 )
 dir = npypath[:-4]
 os.makedirs(dir, exist_ok=True)
@@ -56,10 +56,13 @@ arr = np.load(npypath)
 states = arr.squeeze(1)  # (60, 768, 768)
 
 
-for i in range(states.shape[0] // 10):
-    step = 10 * i
+for i in range(states.shape[0] // 1):
+    step = 1 * i
     title = npypath[63:-4] + f"_step_{step}"
     show_heatmap(states[step], save_path=dir + f"/step_{step}.png", title=title)
+
+ratio = np.divide(states[4], states[3])
+show_heatmap(ratio, save_path=  dir + f"/ratio.png", title = npypath[63:-4] + f"_ratio")
 
 # infos = np.sum(np.abs(states), axis=(1, 2))
 # plt.plot(np.arange(infos.size), infos)
@@ -87,8 +90,8 @@ for i in range(states.shape[0] // 10):
 # plt.savefig(dir + "/states_adjusted.png")
 
 state_norms = []
-for i in range(states.shape[0] // 10):
-    step = i * 10
+for i in range(states.shape[0] // 1):
+    step = i * 1
     state = states[step]
     norms = np.linalg.norm(state, axis=1)  # (768,)
     state_norms.append(norms)
