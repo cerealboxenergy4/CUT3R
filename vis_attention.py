@@ -2,11 +2,13 @@ import matplotlib.pyplot as plt
 import seaborn
 import os, pandas, torch
 import numpy as np
-
+from PIL import Image, ImageOps
+import cv2
+import sys
 
 def save_heatmap(
     arr,
-    figsize=(6,8),
+    figsize=(6, 8),
     save_path=None,
     title=None,
     vmax=None,
@@ -47,11 +49,10 @@ def save_heatmap(
     # plt.show()
     plt.close()
 
+dataset = sys.argv[1]
 
 # 0. choose and load attention tensor file (.pt)
-filepath = (
-    "/media/genchiprofac/Projects/CUT3R/experiments/attentions/chimera_attn_seq.pt"
-)
+filepath = f"/media/genchiprofac/Projects/CUT3R/experiments/attentions/{dataset}_attn_seq.pt"
 dir = filepath[:-3]
 os.makedirs(dir, exist_ok=True)
 
@@ -97,23 +98,120 @@ def visualize_revisit_ratio():
         ylabel="state token dim",
     )
 
+
 # 3. visualize CA for chosen single state token vs image features over depth
 def save_heatmap_for_single_state_token():
-    token_num = 100 
+    token_num = 100
     attn = np.array(attns[1]["state"]["cross"]).squeeze(1)
-    attn_by_depth = attn[:, token_num, :]  # state token of choosing (token_num)_th, dims: (depth, f_image)
-    
+    attn_by_depth = attn[
+        :, token_num, :
+    ]  # state token of choosing (token_num)_th, dims: (depth, f_image)
+
     save_heatmap(
         np.log(attn_by_depth),
         save_path=dir + f"/ca_by_head_token_{token_num}.png",
         title=f"Cross attention weight by head, state token #{token_num}",
-        xlabel= "pose + image dim",
-        ylabel = "head",
-        figsize=(8,8),
-        aspect = attn_by_depth.shape[1]/attn_by_depth.shape[0],
+        xlabel="pose + image dim",
+        ylabel="head",
+        figsize=(8, 8),
+        aspect=attn_by_depth.shape[1] / attn_by_depth.shape[0],
     )
+
+
+def image_to_state_ca_visualization(step):
+    step = step
+    attn = attns[step]
+    from pathlib import Path
+
+    image_dir = Path(f"/media/genchiprofac/Projects/assets/{dataset}")
+    image_files = sorted(
+        list(image_dir.glob("*.jpg"))
+        + list(image_dir.glob("*.png"))
+        + list(image_dir.glob("*.jpeg"))
+    )
+    image = Image.open(image_files[step % len(image_files)]).convert("RGB")
+    image = ImageOps.exif_transpose(image)
+    img_arr = np.array(image)
+
+    h, w, _ = img_arr.shape
+
+    if h >= w:
+        rw = 32 * w / h
+        rh = 32
+    else:
+        rw = 32
+        rh = 32 * h / w
+
+    attn_state_img = np.array(attn["state"]["cross"]).squeeze(1)
+    # print(attn_state_img.shape)
+    # print(attn_state_img.mean(axis=1)[:,0])
+    # print(attn_state_img.mean(axis=1)[:,1])
+    # print(attn_state_img.mean(axis=1)[:, 2])
+
+    how = sys.argv[2]
+
+    if how == "last":
+        camap_state_img = attn_state_img[-1, :,:].mean(axis=0)[1:].reshape(int(rh), int(rw))    # only use last decoder block
+    elif how == "avg":
+        camap_state_img = attn_state_img.mean(axis=(0, 1))[1:].reshape(int(rh), int(rw))      # take depthwise mean for all decoders
+    elif how == "first":
+        camap_state_img = (
+            attn_state_img[0, :, :].mean(axis=0)[1:].reshape(int(rh), int(rw))
+        )  # only use first decoder block
+
+    else:
+        ...
+    camap_state_img[0][0] = 0.001                                                           # 1st entry dominant (100x) -- why ?
+    # save_heatmap(
+    #     np.log(camap_state_img),
+    #     save_path=dir + f"/ca_s2i_step{step}.png",
+    #     title=f"State to image CA",
+    # )
+
+    # visualization of heatmap on original image
+
+    hm_normalized = (camap_state_img - np.min(camap_state_img)) / (
+        np.max(camap_state_img) - np.min(camap_state_img)
+    )
+    hm_normalized = hm_normalized.astype(np.float32)
+
+    heatmap_resized = cv2.resize(hm_normalized, (w, h), interpolation=cv2.INTER_NEAREST)
+    heatmap_uint8 = np.uint8(255 * heatmap_resized)
+    heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+    alpha = 0.5  # 히트맵의 투명도 (0.0 ~ 1.0)
+    # OpenCV는 BGR 순서를 사용하므로 원본 이미지를 RGB -> BGR로 변환
+    original_image_bgr = cv2.cvtColor(img_arr, cv2.COLOR_RGB2BGR)
+    overlayed_image = cv2.addWeighted(
+        heatmap_color, alpha, original_image_bgr, 1 - alpha, 0
+    )
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 5))
+
+    # original image
+    axes[0].imshow(img_arr)
+    axes[0].set_title("Image Frame")
+    axes[0].axis("off")
+
+    # heatmap
+    axes[1].imshow(cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB))
+    axes[1].set_title("Attention Heatmap")
+    axes[1].axis("off")
+
+    # heatmap overlay
+    axes[2].imshow(cv2.cvtColor(overlayed_image, cv2.COLOR_BGR2RGB))
+    axes[2].set_title("Overlay")
+    axes[2].axis("off")
+    plt.tight_layout()
+    plt.savefig(dir + f"/heatmap_overlay_step{step}_{how}.png")
+    plt.close()
+
+    ...
+
 
 if __name__ == "__main__":
     # save_heatmap_by_image_step()
     # visualize_revisit_ratio()
-    save_heatmap_for_single_state_token()
+    # save_heatmap_for_single_state_token()
+    for i in range(30):
+
+        image_to_state_ca_visualization(i)

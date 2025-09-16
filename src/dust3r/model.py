@@ -946,11 +946,109 @@ class ARCroco3DStereo(CroCoNet):
             return ress, views, all_state_args
         return ress, views
 
-    def forward(self, views, ret_state=False):
+    def _forward_impl_skip_state_updates(self, views, ret_state=False):
+        # initialize attention sequence if collect_attention is True
+        if self.collect_attention is True:
+            self.attn_dump_seq = []
+
+        shape, feat_ls, pos = self._encode_views(views)
+        feat = feat_ls[-1]
+        state_feat, state_pos = self._init_state(feat[0], pos[0])
+        mem = self.pose_retriever.mem.expand(feat[0].shape[0], -1, -1)
+        init_state_feat = state_feat.clone()
+        init_mem = mem.clone()
+        state_holder= state_feat.clone()
+        all_state_args = [
+            (state_feat, state_pos, init_state_feat, mem, init_mem)
+        ]  # 이미지 추가되면서 변하는 state 스냅샷 리스트
+        ress = []
+        for i in range(len(views)):
+            feat_i = feat[i]
+            pos_i = pos[i]
+            if self.pose_head_flag:
+                global_img_feat_i = self._get_img_level_feat(feat_i)
+                if i == 0:
+                    pose_feat_i = self.pose_token.expand(feat_i.shape[0], -1, -1)
+                else:
+                    pose_feat_i = self.pose_retriever.inquire(global_img_feat_i, mem)
+                pose_pos_i = -torch.ones(
+                    feat_i.shape[0], 1, 2, device=feat_i.device, dtype=pos_i.dtype
+                )
+            else:
+                pose_feat_i = None
+                pose_pos_i = None
+            new_state_feat, dec = self._recurrent_rollout(
+                state_holder,
+                state_pos,
+                feat_i,
+                pos_i,
+                pose_feat_i,
+                pose_pos_i,
+                init_state_feat,
+                img_mask=views[i]["img_mask"],
+                reset_mask=views[i]["reset"],
+                update=views[i].get("update", None),
+            )
+
+            out_pose_feat_i = dec[-1][:, 0:1]
+            new_mem = self.pose_retriever.update_mem(
+                mem, global_img_feat_i, out_pose_feat_i
+            )
+            assert len(dec) == self.dec_depth + 1
+            head_input = [
+                dec[0].float(),
+                dec[self.dec_depth * 2 // 4][:, 1:].float(),
+                dec[self.dec_depth * 3 // 4][:, 1:].float(),
+                dec[self.dec_depth].float(),
+            ]
+            res = self._downstream_head(head_input, shape[i], pos=pos_i)
+            ress.append(res)
+            img_mask = views[i]["img_mask"]
+            update = views[i].get("update", None)
+            if update is not None:
+                update_mask = (
+                    img_mask & update
+                )  # if don't update, then whatever img_mask
+            else:
+                update_mask = img_mask
+            update_mask = update_mask[:, None, None].float()
+
+            state_feat = new_state_feat * update_mask + state_holder * (
+            1 - update_mask
+            )    # state_feat = new state_feat iff update_mask = 1  # update global state
+            mem = new_mem * update_mask + mem * (
+                1 - update_mask
+            )  # then update local state
+            reset_mask = views[i]["reset"]
+            if reset_mask is not None:
+                reset_mask = reset_mask[:, None, None].float()
+                state_feat = init_state_feat * reset_mask + state_feat * (
+                    1 - reset_mask
+                )
+                mem = init_mem * reset_mask + mem * (1 - reset_mask)
+            all_state_args.append(
+                (state_feat, state_pos, init_state_feat, mem, init_mem)
+            )
+            if i % 2 == 0:
+                state_holder = state_feat
+
         if ret_state:
+            return ress, views, all_state_args
+        return ress, views
+
+    def forward(self, views, ret_state=False, skip_state=False):
+        if ret_state:
+            if skip_state:
+                ress, views, state_args = self._forward_impl_skip_state_updates(views, ret_state=ret_state)
+                return ARCroco3DStereoOutput(ress=ress, views=views), state_args
             ress, views, state_args = self._forward_impl(views, ret_state=ret_state)
             return ARCroco3DStereoOutput(ress=ress, views=views), state_args
         else:
+            if skip_state:
+                ress, views, state_args = self._forward_impl_skip_state_updates(
+                    views, ret_state=ret_state
+                )
+                return ARCroco3DStereoOutput(ress=ress, views=views), state_args
             ress, views = self._forward_impl(views, ret_state=ret_state)
             return ARCroco3DStereoOutput(ress=ress, views=views)
 

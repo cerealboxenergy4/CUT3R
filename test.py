@@ -6,7 +6,7 @@ import seaborn as sns
 import pandas as pd
 
 
-def show_heatmap(arr, save_path=None, title=None):
+def show_heatmap(arr, save_path=None, title=None, vmin=-2, vmax=10):
     """
     arr: (768, 768) ndarray or torch.Tensor
     """
@@ -45,7 +45,7 @@ def show_heatmap(arr, save_path=None, title=None):
 
 
 npypath = (
-    "/media/genchiprofac/Projects/CUT3R/experiments/state_per_frame/test_chimera.npy"
+    "/media/genchiprofac/Projects/CUT3R/experiments/state_per_frame/test_repeat.npy"
 )
 dir = npypath[:-4]
 os.makedirs(dir, exist_ok=True)
@@ -61,34 +61,42 @@ for i in range(states.shape[0] // 1):
     title = npypath[63:-4] + f"_step_{step}"
     show_heatmap(states[step], save_path=dir + f"/step_{step}.png", title=title)
 
-ratio = np.divide(states[4], states[3])
-show_heatmap(ratio, save_path=  dir + f"/ratio.png", title = npypath[63:-4] + f"_ratio")
+ratio = np.divide(states[3], states[2])
+show_heatmap(ratio, save_path=  dir + f"/ratio.png", title = npypath[63:-4] + f"_ratio", vmax=2, vmin=0.5)
 
-# infos = np.sum(np.abs(states), axis=(1, 2))
-# plt.plot(np.arange(infos.size), infos)
-# plt.xlabel("image #")
-# plt.ylabel("sum of state token entries")
-# plt.tight_layout()
-# plt.savefig(dir + "/states.png")
 
-# infos_minus = []
-# for i in range(states.shape[0]):
-#     state = np.abs(states[i])
-#     print("state shape: "+ str(state.shape))
-#     state_sum = state.sum()
-#     column_sums = np.sum(state, axis=0)
-#     column_sums.sort()
-#     print(column_sums)
-#     state_sum_minus = np.sum(column_sums[:-10])
-#     infos_minus.append(state_sum_minus)
-#     print("total sum of info: " + str(state_sum), ", neglecting top n: " + str(state_sum_minus))
 
-# plt.plot(np.arange(len(infos_minus)), infos_minus)
-# plt.xlabel("image #")
-# plt.ylabel("sum of state token entries")
-# plt.tight_layout()
-# plt.savefig(dir + "/states_adjusted.png")
+"""
+# 2. State total information (entry size)
+infos = np.sum(np.abs(states), axis=(1, 2))
+plt.plot(np.arange(infos.size), infos)
+plt.xlabel("image #")
+plt.ylabel("sum of state token entries")
+plt.tight_layout()
+plt.savefig(dir + "/states.png")
 
+infos_minus = []
+for i in range(states.shape[0]):
+    state = np.abs(states[i])
+    print("state shape: "+ str(state.shape))
+    state_sum = state.sum()
+    column_sums = np.sum(state, axis=0)
+    column_sums.sort()
+    print(column_sums)
+    state_sum_minus = np.sum(column_sums[:-10])
+    infos_minus.append(state_sum_minus)
+    print("total sum of info: " + str(state_sum), ", neglecting top n: " + str(state_sum_minus))
+
+plt.plot(np.arange(len(infos_minus)), infos_minus)
+plt.xlabel("image #")
+plt.ylabel("sum of state token entries")
+plt.tight_layout()
+plt.savefig(dir + "/states_adjusted.png")
+"""
+
+
+"""
+3. State norm violin plot
 state_norms = []
 for i in range(states.shape[0] // 1):
     step = i * 1
@@ -119,3 +127,4 @@ plt.xlabel("image step")
 plt.ylabel("norm of state token")
 plt.tight_layout()
 plt.savefig(dir + "/state_norm_vplot.png")
+"""

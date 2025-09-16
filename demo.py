@@ -79,8 +79,22 @@ def parse_args():
     parser.add_argument(
         "--revisit",
         type=int,
-        default="1",
+        default=1,
         help="number of revisits during inference",
+    )
+
+    parser.add_argument(
+        "--recurrent",
+        type=int,
+        default=0,
+        help="1 for recurrent inference, 0 for single inference (default)",
+    )
+
+    parser.add_argument(
+        "--skip_state",
+        type=bool,
+        default=False,
+        help="skip state update every other time if set to True",
     )
 
     return parser.parse_args()
@@ -372,10 +386,11 @@ def run_inference(args):
 
     revisit = args.revisit
     revisit_update = False
-    is_reccurent = False
-    image_start_index = 0  # index starts from 0
-    image_end_index = 20
+    is_reccurent = True if args.recurrent == 1 else False
+    image_start_index = None  # index starts from 0
+    image_end_index = None
     collect_attention = True
+    skip_state= args.skip_state
 
     print("Preparing input views...")
     views = prepare_input(
@@ -406,9 +421,9 @@ def run_inference(args):
         outputs, state_args = inference_recurrent(views, model, device)
     else:
         if collect_attention:       # get attention dump for attention visualization
-            outputs, state_args, attnseq = inference(views, model, device, collect=collect_attention)
+            outputs, state_args, attnseq = inference(views, model, device, collect=collect_attention, skip_state=skip_state)
         else:
-            outputs, state_args= inference(views, model, device)
+            outputs, state_args = inference(views, model, device, skip_state=skip_state)
 
     total_time = time.time() - start_time
     per_frame_time = total_time / len(views)
