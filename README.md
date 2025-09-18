@@ -2,10 +2,9 @@
 Modification for doing experiments on <strong>Continuous 3D Perception Model with Persistent State</strong>, CVPR 2025 (Oral)
 
 
-
 ## TODO
 - [x] Add attention map visualization tool
-- [ ] Do stuff to increase state memory span
+- [ ] Do stuff to increase state memory 
 
 
 
