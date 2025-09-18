@@ -53,3 +53,14 @@ docs/_build/
 *.pth
 data
 src/checkpoints
+
+# videos
+*.mp4
+*.MOV
+*.jpeg
+*.npy
+
+# personal experiments
+experiments/
+demo_tmp/
+tmp/

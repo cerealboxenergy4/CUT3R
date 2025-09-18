@@ -62,6 +62,8 @@ def loss_of_one_batch(
     ret=None,
     img_mask=None,
     inference=False,
+    collect=False,
+    skip_state=False,
 ):
     if len(batch) > 2:
         assert (
@@ -72,9 +74,12 @@ def loss_of_one_batch(
 
     with torch.cuda.amp.autocast(enabled=not inference):
         if inference:
-            output, state_args = model(batch, ret_state=True)
+            output, state_args = model(batch, ret_state=True, skip_state=skip_state)
             preds, batch = output.ress, output.views
             result = dict(views=batch, pred=preds)
+            if collect:
+                attn_seq = model.attn_dump_seq
+                return result, state_args, attn_seq
             return result[ret] if ret else result, state_args
         else:
             output = model(batch)
@@ -217,7 +222,7 @@ def loss_of_one_batch_tbptt(
 
 
 @torch.no_grad()
-def inference(groups, model, device, verbose=True):
+def inference(groups, model, device, verbose=True, collect=False, skip_state=False):
     ignore_keys = set(
         ["depthmap", "dataset", "label", "instance", "idx", "true_shape", "rng"]
     )
@@ -232,8 +237,22 @@ def inference(groups, model, device, verbose=True):
 
     if verbose:
         print(f">> Inference with model on {len(groups)} image/raymaps")
-
-    res, state_args = loss_of_one_batch(groups, model, None, None, inference=True)
+    if collect:
+        res, state_args, attnseq = loss_of_one_batch(
+            groups, model, None, None, inference=True, collect=collect, skip_state=skip_state
+        )
+        result = to_cpu(res)
+        return result, state_args, attnseq
+    else:
+        res, state_args = loss_of_one_batch(
+            groups,
+            model,
+            None,
+            None,
+            inference=True,
+            collect=collect,
+            skip_state=skip_state
+        )
     result = to_cpu(res)
     return result, state_args
 

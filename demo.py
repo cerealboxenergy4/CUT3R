@@ -76,11 +76,32 @@ def parse_args():
         help="value for tempfile.tempdir",
     )
 
+    parser.add_argument(
+        "--revisit",
+        type=int,
+        default=1,
+        help="number of revisits during inference",
+    )
+
+    parser.add_argument(
+        "--recurrent",
+        type=int,
+        default=0,
+        help="1 for recurrent inference, 0 for single inference (default)",
+    )
+
+    parser.add_argument(
+        "--skip_state",
+        type=bool,
+        default=False,
+        help="skip state update every other time if set to True",
+    )
+
     return parser.parse_args()
 
 
 def prepare_input(
-    img_paths, img_mask, size, raymaps=None, raymap_mask=None, revisit=1, update=True
+    img_paths, img_mask, size, start=None, end=None, raymaps=None, raymap_mask=None, revisit=1, update=True
 ):
     """
     Prepare input views for inference from a list of image paths.
@@ -102,13 +123,22 @@ def prepare_input(
 
     images = load_images(img_paths, size=size)
     views = []
+    if start is not None:
+        if end is not None:
+            images = images[start:end+1]
+        else: 
+            images = images[start:]
+    else:
+        if end is not None:
+            images = images[:end+1]
+    
 
     if raymaps is None and raymap_mask is None:
         # Only images are provided.
         for i in range(len(images)):
             view = {
                 "img": images[i]["img"],
-                "ray_map": torch.full(
+                "ray_map": torch.full(  # (1, 6, H, W) tensor filled with NaN (6 = 3dim origin + 3dim direction of ray)
                     (
                         images[i]["img"].shape[0],
                         6,
@@ -198,6 +228,7 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True):
     Returns:
         tuple: (points, colors, confidence, camera parameters dictionary)
     """
+
     from src.dust3r.utils.camera import pose_encoding_to_camera
     from src.dust3r.post_process import estimate_focal_knowing_depth
     from src.dust3r.utils.geometry import geotrf
@@ -352,13 +383,24 @@ def run_inference(args):
     img_mask = [True] * len(img_paths)
 
     # Prepare input views.
+
+    revisit = args.revisit
+    revisit_update = False
+    is_reccurent = True if args.recurrent == 1 else False
+    image_start_index = None  # index starts from 0
+    image_end_index = None
+    collect_attention = True
+    skip_state= args.skip_state
+
     print("Preparing input views...")
     views = prepare_input(
         img_paths=img_paths,
         img_mask=img_mask,
+        start=image_start_index,
+        end = image_end_index,
         size=args.size,
-        revisit=1,
-        update=True,
+        revisit=revisit,
+        update=revisit_update,
     )
     if tmpdirname is not None:
         shutil.rmtree(tmpdirname)
@@ -367,22 +409,59 @@ def run_inference(args):
     print(f"Loading model from {args.model_path}...")
     model = ARCroco3DStereo.from_pretrained(args.model_path).to(device)
     model.eval()
+    if collect_attention:
+        model.collect_attention = True
+        model.gradient_checkpointing = False
 
     # Run inference.
     print("Running inference...")
     start_time = time.time()
-    outputs, state_args = inference(views, model, device)
+
+    if is_reccurent:
+        outputs, state_args = inference_recurrent(views, model, device)
+    else:
+        if collect_attention:       # get attention dump for attention visualization
+            outputs, state_args, attnseq = inference(views, model, device, collect=collect_attention, skip_state=skip_state)
+        else:
+            outputs, state_args = inference(views, model, device, skip_state=skip_state)
+
     total_time = time.time() - start_time
     per_frame_time = total_time / len(views)
     print(
         f"Inference completed in {total_time:.2f} seconds (average {per_frame_time:.2f} s per frame)."
     )
 
+    # 단계별 state features 저장
+    from pathlib import Path
+    import re
+
+    state_features = np.stack(
+        [sa[0].detach().cpu().numpy() for sa in state_args], axis=0  # 각 시점의 (B,S,D)
+    )
+
+    dir = "experiments/state_per_frame"
+    os.makedirs(dir, exist_ok=True)
+    seq = Path(args.seq_path)
+
+    # 디렉터리 경로든 파일 경로든 마지막 이름만 사용
+    seq_id = seq.stem if seq.suffix else seq.name          # 예: 'house_1x_2fps'
+
+    # 파일명 안전화(슬래시/공백 등 제거)
+    seq_id = re.sub(r'[^A-Za-z0-9._-]+', '_', seq_id)
+    np.save(f"experiments/state_per_frame/test_{seq_id}.npy", state_features)
+    print("State tensor saved to:", os.listdir(dir))
+
+    if collect_attention:
+        # attention dump 저장
+        dir_att = "experiments/attentions"
+        os.makedirs(dir_att, exist_ok=True)
+        torch.save(attnseq, dir_att + f"/{seq_id}_attn_seq.pt")
+
     # Process outputs for visualization.
     print("Preparing output for visualization...")
     pts3ds_other, colors, conf, cam_dict = prepare_output(
-        outputs, args.output_dir, 1, True
-    )
+        outputs, args.output_dir, revisit, True
+    )   # set revisit(3rd argument) to 1 to visualize before / after revisit simultaneously, else set to revisit 
 
     # Convert tensors to numpy arrays for visualization.
     pts3ds_to_vis = [p.cpu().numpy() for p in pts3ds_other]
@@ -402,16 +481,19 @@ def run_inference(args):
         edge_color_list=edge_colors,
         show_camera=True,
         vis_threshold=args.vis_threshold,
-        size = args.size
+        size=args.size,
     )
     viewer.run()
 
+def attn_hook():
+    
+    ...
 
 def main():
     args = parse_args()
     if not args.seq_path:
         print(
-            "No inputs found! Please use our gradio demo if you would like to iteractively upload inputs."
+            "No inputs found! Please use our gradio demo if you would like to interactively upload inputs."
         )
         return
     else:

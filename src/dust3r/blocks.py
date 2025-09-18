@@ -99,6 +99,10 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope.float() if rope is not None else None
 
+        # added for attention map visualization
+        self.collect_attention = False
+        self.last_alpha = None
+
     def forward(self, x, xpos):
         B, N, C = x.shape
 
@@ -120,13 +124,22 @@ class Attention(nn.Module):
             q = q.to(q_type)
             k = k.to(k_type)
 
-        x = (
-            scaled_dot_product_attention(
-                query=q, key=k, value=v, dropout_p=self.attn_drop.p, scale=self.scale
+        if self.collect_attention:
+            # compute α explicitly and store
+            scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * self.scale   # [B,H,Nq,Nk]
+            alpha  = torch.softmax(scores, dim=-1)                                       # [B,H,Nq,Nk]
+            self.last_alpha = alpha.detach()
+            x = torch.matmul(alpha.to(v.dtype), v)  # [B,H,N, head_dim]                # [B,H,Nq,Dv]
+            x = x.transpose(1, 2).contiguous().reshape(B, N, C)
+
+        else:
+            x = (
+                scaled_dot_product_attention(
+                    query=q, key=k, value=v, dropout_p=self.attn_drop.p, scale=self.scale
+                )
+                .transpose(1, 2)
+                .reshape(B, N, C)
             )
-            .transpose(1, 2)
-            .reshape(B, N, C)
-        )
 
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -193,6 +206,10 @@ class CrossAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
         self.rope = rope.float() if rope is not None else None
+        
+        # added for attention map visualization
+        self.collect_attention = False
+        self.last_alpha = None
 
     def forward(self, query, key, value, qpos, kpos):
         B, Nq, C = query.shape
@@ -230,13 +247,24 @@ class CrossAttention(nn.Module):
                     k = self.rope(k, kpos)
                 k = k.to(k_type)
 
-        x = (
-            scaled_dot_product_attention(
-                query=q, key=k, value=v, dropout_p=self.attn_drop.p, scale=self.scale
+
+        if self.collect_attention:
+            scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * self.scale  # [B,H,Nq,Nk]
+            alpha = torch.softmax(scores, dim=-1)
+            self.last_alpha = alpha.detach()  # [B,H,Nq,Nk]
+            # if self.training and self.attn_drop.p > 0:
+            #     alpha = torch.dropout(alpha, self.attn_drop.p, True)
+            x = torch.matmul(alpha.to(v.dtype), v)  # [B,H,Nq,d]
+            x = x.transpose(1, 2).contiguous().reshape(B, Nq, C)
+
+        else:
+            x = (
+                scaled_dot_product_attention(  # 문서 보고 따라하기
+                    query=q, key=k, value=v, dropout_p=self.attn_drop.p, scale=self.scale
+                )
+                .transpose(1, 2)
+                .reshape(B, Nq, C)
             )
-            .transpose(1, 2)
-            .reshape(B, Nq, C)
-        )
 
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -506,7 +534,7 @@ if __name__ == "__main__":
                     4,
                     qkv_bias=True,
                     norm_layer=partial(nn.LayerNorm, eps=1e-6),
-                    rope=RoPE2D(100),
+                    rope=None, #RoPE2D(100)
                 )
                 for _ in range(2)
             ]

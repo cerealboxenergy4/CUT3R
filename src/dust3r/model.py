@@ -76,6 +76,8 @@ def load_model(model_path, device, verbose=True):
     args = ckpt["args"].model.replace(
         "ManyAR_PatchEmbed", "PatchEmbedDust3R"
     )  # ManyAR only for aspect ratio not consistent
+
+
     if "landscape_only" not in args:
         args = args[:-2] + ", landscape_only=False))"
     else:
@@ -91,6 +93,10 @@ def load_model(model_path, device, verbose=True):
         print(s)
     return net.to(device)
 
+def slim_copy(alpha, mean_over=1):
+        with torch.no_grad():
+            a = alpha.detach().mean(mean_over).to(torch.float16).cpu()  # [B,Sq,Sk] → FP16 CPU
+        return a
 
 class ARCroco3DStereoConfig(PretrainedConfig):
     model_type = "arcroco_3d_stereo"
@@ -161,7 +167,7 @@ class LocalMemory(nn.Module):
         self.masked_token = nn.Parameter(
             torch.randn(1, 1, v_dim) * 0.2, requires_grad=True
         )
-        self.mem = nn.Parameter(
+        self.mem = nn.Parameter(  # 메모리 텐서
             torch.randn(1, size, 2 * v_dim) * 0.2, requires_grad=True
         )
         self.write_blocks = nn.ModuleList(
@@ -301,6 +307,10 @@ class ARCroco3DStereo(CroCoNet):
             **self.croco_args,
         )
         self.set_freeze(config.freeze)
+
+        # added for attention map visualization
+        self.collect_attention = False
+        self.attn_dump_seq = None
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kw):
@@ -537,7 +547,7 @@ class ARCroco3DStereo(CroCoNet):
 
     def _encode_state(self, image_tokens, image_pos):
         batch_size = image_tokens.shape[0]
-        state_feat = self.register_tokens(
+        state_feat = self.register_tokens(  # (S, embed)
             torch.arange(self.state_size, device=image_pos.device)
         )
         if self.state_pe == "1d":
@@ -564,7 +574,7 @@ class ARCroco3DStereo(CroCoNet):
             )
         elif self.state_pe == "none":
             state_pos = None
-        state_feat = state_feat[None].expand(batch_size, -1, -1)
+        state_feat = state_feat[None].expand(batch_size, -1, -1)  # (B, S, Embed)
         return state_feat, state_pos, None
 
     def _encode_views(self, views, img_mask=None, ray_mask=None):
@@ -655,7 +665,7 @@ class ARCroco3DStereo(CroCoNet):
             shapes.chunk(len(views), dim=0),
             [out.chunk(len(views), dim=0) for out in full_out],
             full_pos.chunk(len(views), dim=0),
-        )
+        )    
 
     def _decoder(self, f_state, pos_state, f_img, pos_img, f_pose, pos_pose):
         final_output = [(f_state, f_img)]  # before projection
@@ -665,8 +675,22 @@ class ARCroco3DStereo(CroCoNet):
             assert f_pose is not None and pos_pose is not None
             f_img = torch.cat([f_pose, f_img], dim=1)
             pos_img = torch.cat([pos_pose, pos_img], dim=1)
-        final_output.append((f_state, f_img))
-        for blk_state, blk_img in zip(self.dec_blocks_state, self.dec_blocks):
+
+        # --- NEW: init dump lists if collecting ---
+        if self.collect_attention:
+            dump = {
+                "state": {"self": [], "cross": []},
+                "img": {"self": [], "cross": []},
+            }
+            # 모든 디코더 블럭의 Attention/CrossAttention에 collect 켜주기
+            for m in list(self.dec_blocks_state) + list(self.dec_blocks):
+                m.attn.collect_attention = True
+                m.cross_attn.collect_attention = True
+
+        final_output.append((f_state, f_img))  # embedding한 f_img가 final_output[1]
+        for blk_state, blk_img in zip(
+            self.dec_blocks_state, self.dec_blocks
+        ):  # decoder block depth만큼 반복
             if (
                 self.gradient_checkpointing
                 and self.training
@@ -674,14 +698,14 @@ class ARCroco3DStereo(CroCoNet):
             ):
                 f_state, _ = checkpoint(
                     blk_state,
-                    *final_output[-1][::+1],
+                    *final_output[-1][::+1],  # f_state, f_img
                     pos_state,
                     pos_img,
                     use_reentrant=not self.fixed_input_length,
                 )
                 f_img, _ = checkpoint(
                     blk_img,
-                    *final_output[-1][::-1],
+                    *final_output[-1][::-1],  # f_img, f_state
                     pos_img,
                     pos_state,
                     use_reentrant=not self.fixed_input_length,
@@ -689,13 +713,36 @@ class ARCroco3DStereo(CroCoNet):
             else:
                 f_state, _ = blk_state(*final_output[-1][::+1], pos_state, pos_img)
                 f_img, _ = blk_img(*final_output[-1][::-1], pos_img, pos_state)
-            final_output.append((f_state, f_img))
-        del final_output[1]  # duplicate with final_output[0]
+
+            # --- NEW: collect α after each block ---
+            if self.collect_attention:
+                dump["state"]["self"].append(
+                    slim_copy(blk_state.attn.last_alpha)
+                )  # [B,H,S,S]
+                dump["state"]["cross"].append(
+                    slim_copy(blk_state.cross_attn.last_alpha)  # [B, H, S_state, S_img]
+                )
+                dump["img"]["self"].append(slim_copy(blk_img.attn.last_alpha))  # [B,H,S_img,S_img]
+                dump["img"]["cross"].append(
+                    slim_copy(blk_img.cross_attn.last_alpha)  # [B,H,S_img,S_state]
+                )
+
+            final_output.append((f_state, f_img))  # depth개만큼 튜플 추가
+        del final_output[1]  # duplicate with final_output[0] 과도기 항목 제거
         final_output[-1] = (
             self.dec_norm_state(final_output[-1][0]),
-            self.dec_norm(final_output[-1][1]),
+            self.dec_norm(final_output[-1][1]),  # 마지막 D단계 정규화
         )
-        return zip(*final_output)
+
+        # --- NEW: store to model for later access ---
+        if self.collect_attention:
+            self.attn_dump_seq.append(dump)
+            # 시각화 모드 끝났으면 스위치 끄기 원하면 여기서 False로 돌려도 됨
+            # for m in list(self.dec_blocks_state) + list(self.dec_blocks):
+            #     m.attn.collect_attention = False
+            #     m.cross_attn.collect_attention = False
+
+        return zip(*final_output)  # [(0~D단계 f_state), (0~D단계 f_img)]
 
     def _downstream_head(self, decout, img_shape, **kwargs):
         B, S, D = decout[-1].shape
@@ -707,7 +754,9 @@ class ARCroco3DStereo(CroCoNet):
         Current Version: input the first frame img feature and pose to initialize the state feature and pose
         """
         state_feat, state_pos, _ = self._encode_state(image_tokens, image_pos)
-        state_feat = self.decoder_embed_state(state_feat)
+        state_feat = self.decoder_embed_state(
+            state_feat
+        )  # (B, S, Embed) -> (B, S, Encoded) (768 -> 768)
         return state_feat, state_pos
 
     def _recurrent_rollout(
@@ -814,13 +863,19 @@ class ARCroco3DStereo(CroCoNet):
         return res, (state_feat, mem)
 
     def _forward_impl(self, views, ret_state=False):
+        # initialize attention sequence if collect_attention is True
+        if self.collect_attention is True:
+            self.attn_dump_seq = []
+
         shape, feat_ls, pos = self._encode_views(views)
         feat = feat_ls[-1]
         state_feat, state_pos = self._init_state(feat[0], pos[0])
         mem = self.pose_retriever.mem.expand(feat[0].shape[0], -1, -1)
         init_state_feat = state_feat.clone()
         init_mem = mem.clone()
-        all_state_args = [(state_feat, state_pos, init_state_feat, mem, init_mem)]
+        all_state_args = [
+            (state_feat, state_pos, init_state_feat, mem, init_mem)
+        ]  # 이미지 추가되면서 변하는 state 스냅샷 리스트
         ress = []
         for i in range(len(views)):
             feat_i = feat[i]
@@ -873,7 +928,7 @@ class ARCroco3DStereo(CroCoNet):
             update_mask = update_mask[:, None, None].float()
             state_feat = new_state_feat * update_mask + state_feat * (
                 1 - update_mask
-            )  # update global state
+            )  # state_feat = new state_feat iff update_mask = 1  # update global state
             mem = new_mem * update_mask + mem * (
                 1 - update_mask
             )  # then update local state
@@ -891,11 +946,109 @@ class ARCroco3DStereo(CroCoNet):
             return ress, views, all_state_args
         return ress, views
 
-    def forward(self, views, ret_state=False):
+    def _forward_impl_skip_state_updates(self, views, ret_state=False):
+        # initialize attention sequence if collect_attention is True
+        if self.collect_attention is True:
+            self.attn_dump_seq = []
+
+        shape, feat_ls, pos = self._encode_views(views)
+        feat = feat_ls[-1]
+        state_feat, state_pos = self._init_state(feat[0], pos[0])
+        mem = self.pose_retriever.mem.expand(feat[0].shape[0], -1, -1)
+        init_state_feat = state_feat.clone()
+        init_mem = mem.clone()
+        state_holder= state_feat.clone()
+        all_state_args = [
+            (state_feat, state_pos, init_state_feat, mem, init_mem)
+        ]  # 이미지 추가되면서 변하는 state 스냅샷 리스트
+        ress = []
+        for i in range(len(views)):
+            feat_i = feat[i]
+            pos_i = pos[i]
+            if self.pose_head_flag:
+                global_img_feat_i = self._get_img_level_feat(feat_i)
+                if i == 0:
+                    pose_feat_i = self.pose_token.expand(feat_i.shape[0], -1, -1)
+                else:
+                    pose_feat_i = self.pose_retriever.inquire(global_img_feat_i, mem)
+                pose_pos_i = -torch.ones(
+                    feat_i.shape[0], 1, 2, device=feat_i.device, dtype=pos_i.dtype
+                )
+            else:
+                pose_feat_i = None
+                pose_pos_i = None
+            new_state_feat, dec = self._recurrent_rollout(
+                state_holder,
+                state_pos,
+                feat_i,
+                pos_i,
+                pose_feat_i,
+                pose_pos_i,
+                init_state_feat,
+                img_mask=views[i]["img_mask"],
+                reset_mask=views[i]["reset"],
+                update=views[i].get("update", None),
+            )
+
+            out_pose_feat_i = dec[-1][:, 0:1]
+            new_mem = self.pose_retriever.update_mem(
+                mem, global_img_feat_i, out_pose_feat_i
+            )
+            assert len(dec) == self.dec_depth + 1
+            head_input = [
+                dec[0].float(),
+                dec[self.dec_depth * 2 // 4][:, 1:].float(),
+                dec[self.dec_depth * 3 // 4][:, 1:].float(),
+                dec[self.dec_depth].float(),
+            ]
+            res = self._downstream_head(head_input, shape[i], pos=pos_i)
+            ress.append(res)
+            img_mask = views[i]["img_mask"]
+            update = views[i].get("update", None)
+            if update is not None:
+                update_mask = (
+                    img_mask & update
+                )  # if don't update, then whatever img_mask
+            else:
+                update_mask = img_mask
+            update_mask = update_mask[:, None, None].float()
+
+            state_feat = new_state_feat * update_mask + state_holder * (
+            1 - update_mask
+            )    # state_feat = new state_feat iff update_mask = 1  # update global state
+            mem = new_mem * update_mask + mem * (
+                1 - update_mask
+            )  # then update local state
+            reset_mask = views[i]["reset"]
+            if reset_mask is not None:
+                reset_mask = reset_mask[:, None, None].float()
+                state_feat = init_state_feat * reset_mask + state_feat * (
+                    1 - reset_mask
+                )
+                mem = init_mem * reset_mask + mem * (1 - reset_mask)
+            all_state_args.append(
+                (state_feat, state_pos, init_state_feat, mem, init_mem)
+            )
+            if i % 2 == 0:
+                state_holder = state_feat
+
         if ret_state:
+            return ress, views, all_state_args
+        return ress, views
+
+    def forward(self, views, ret_state=False, skip_state=False):
+        if ret_state:
+            if skip_state:
+                ress, views, state_args = self._forward_impl_skip_state_updates(views, ret_state=ret_state)
+                return ARCroco3DStereoOutput(ress=ress, views=views), state_args
             ress, views, state_args = self._forward_impl(views, ret_state=ret_state)
             return ARCroco3DStereoOutput(ress=ress, views=views), state_args
         else:
+            if skip_state:
+                ress, views, state_args = self._forward_impl_skip_state_updates(
+                    views, ret_state=ret_state
+                )
+                return ARCroco3DStereoOutput(ress=ress, views=views), state_args
             ress, views = self._forward_impl(views, ret_state=ret_state)
             return ARCroco3DStereoOutput(ress=ress, views=views)
 
