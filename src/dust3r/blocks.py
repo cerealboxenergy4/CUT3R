@@ -324,7 +324,7 @@ class DecoderBlock(nn.Module):
         x = x + self.drop_path(self.mlp(self.norm3(x)))
         return x, y
 
-
+    
 class CustomDecoderBlock(nn.Module):
 
     def __init__(

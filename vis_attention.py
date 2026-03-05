@@ -1,5 +1,4 @@
 import matplotlib.pyplot as plt
-import seaborn
 import os, pandas, torch
 import numpy as np
 from PIL import Image, ImageOps
@@ -52,7 +51,7 @@ def save_heatmap(
 dataset = sys.argv[1]
 
 # 0. choose and load attention tensor file (.pt)
-filepath = f"/media/genchiprofac/Projects/CUT3R/experiments/attentions/{dataset}_attn_seq.pt"
+filepath = f"/home/hunn/CUT3R/experiments/attentions/{dataset}_attn_seq.pt"
 dir = filepath[:-3]
 os.makedirs(dir, exist_ok=True)
 
@@ -123,7 +122,7 @@ def image_to_state_ca_visualization(step):
     attn = attns[step]
     from pathlib import Path
 
-    image_dir = Path(f"/media/genchiprofac/Projects/assets/{dataset}")
+    image_dir = Path(f"/home/hunn/inputs/{dataset}")
     image_files = sorted(
         list(image_dir.glob("*.jpg"))
         + list(image_dir.glob("*.png"))
@@ -202,16 +201,17 @@ def image_to_state_ca_visualization(step):
     axes[2].set_title("Overlay")
     axes[2].axis("off")
     plt.tight_layout()
-    plt.savefig(dir + f"/heatmap_overlay_step{step}_{how}.png")
+    os.makedirs(dir+f"/{how}", exist_ok=True)
+    plt.savefig(dir + f"/{how}/heatmap_overlay_step{step}_{how}.png")
     plt.close()
-
-    ...
 
 
 if __name__ == "__main__":
     # save_heatmap_by_image_step()
     # visualize_revisit_ratio()
     # save_heatmap_for_single_state_token()
-    for i in range(30):
-
+    for i in [5, 6, 17, 18, 19, 2, 3, 11, 14]:
+        image_to_state_ca_visualization(i+28)
         image_to_state_ca_visualization(i)
+        
+

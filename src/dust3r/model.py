@@ -72,7 +72,7 @@ def strip_module(state_dict):
 def load_model(model_path, device, verbose=True):
     if verbose:
         print("... loading model from", model_path)
-    ckpt = torch.load(model_path, map_location="cpu")
+    ckpt = torch.load(model_path, map_location="cpu", weights_only =False)
     args = ckpt["args"].model.replace(
         "ManyAR_PatchEmbed", "PatchEmbedDust3R"
     )  # ManyAR only for aspect ratio not consistent
@@ -1051,7 +1051,7 @@ class ARCroco3DStereo(CroCoNet):
                 return ARCroco3DStereoOutput(ress=ress, views=views), state_args
             ress, views = self._forward_impl(views, ret_state=ret_state)
             return ARCroco3DStereoOutput(ress=ress, views=views)
-
+     
     def inference_step(
         self, view, state_feat, state_pos, init_state_feat, mem, init_mem
     ):
