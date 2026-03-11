@@ -367,6 +367,34 @@ def build_dataset(dataset, batch_size, num_workers, accelerator, test=False, fix
     return loader
 
 
+def apply_bayesian_regularizer(loss, loss_details, bayesian_stats, kl_weight):
+    if loss_details is None:
+        loss_details = {}
+    else:
+        loss_details = dict(loss_details)
+
+    if not bayesian_stats or not bayesian_stats.get("enabled", False):
+        return loss, loss_details
+
+    loss_details["bayes_alpha_mean"] = float(bayesian_stats["alpha_mean"].detach())
+    loss_details["bayes_alpha_var"] = float(bayesian_stats["alpha_var"].detach())
+    loss_details["bayes_alpha_min"] = float(bayesian_stats["alpha_min"].detach())
+    loss_details["bayes_alpha_max"] = float(bayesian_stats["alpha_max"].detach())
+    if "alpha_gamma" in bayesian_stats:
+        loss_details["bayes_gamma_mean"] = float(bayesian_stats["alpha_gamma"].mean().detach())
+    if "omega" in bayesian_stats:
+        loss_details["bayes_omega_sum"] = float(bayesian_stats["omega"].sum().detach())
+
+    if kl_weight <= 0:
+        return loss, loss_details
+
+    kl_loss = bayesian_stats["kl_loss"]
+    loss_details["task_loss"] = float(loss.detach())
+    loss_details["bayes_kl"] = float(kl_loss.detach())
+    loss_details["bayes_kl_weight"] = kl_weight
+    return loss + kl_weight * kl_loss, loss_details
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     criterion: torch.nn.Module,
@@ -443,6 +471,21 @@ def train_one_epoch(
                     use_amp=bool(args.amp),
                 )
             loss, loss_details = result["loss"]  # criterion returns two values
+            bayesian_stats = result.get("bayesian")
+            kl_weight = float(
+                getattr(accelerator.unwrap_model(model).config, "bayesian_kl_weight", 0.0)
+            )
+            if not result.get("already_backprop", False):
+                loss, loss_details = apply_bayesian_regularizer(
+                    loss, loss_details, bayesian_stats, kl_weight
+                )
+            elif bayesian_stats and bayesian_stats.get("enabled", False):
+                _, loss_details = apply_bayesian_regularizer(
+                    torch.as_tensor(loss, device=accelerator.device),
+                    loss_details,
+                    bayesian_stats,
+                    0.0,
+                )
 
             loss_value = float(loss)
 
@@ -594,6 +637,13 @@ def test_one_epoch(
         )
 
         loss_value, loss_details = result["loss"]  # criterion returns two values
+        bayesian_stats = result.get("bayesian")
+        _, loss_details = apply_bayesian_regularizer(
+            loss_value if isinstance(loss_value, torch.Tensor) else torch.as_tensor(loss_value, device=device),
+            loss_details,
+            bayesian_stats,
+            0.0,
+        )
         metric_logger.update(loss=float(loss_value), **loss_details)
 
     printer.info("Averaged stats: %s", metric_logger)

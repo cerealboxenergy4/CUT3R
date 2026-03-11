@@ -8,6 +8,12 @@ from accelerate import Accelerator
 import re
 
 
+def _unwrap_model(model, accelerator):
+    if accelerator is not None:
+        return accelerator.unwrap_model(model)
+    return model
+
+
 def custom_sort_key(key):
     text = key.split("/")
     if len(text) > 1:
@@ -76,7 +82,8 @@ def loss_of_one_batch(
         if inference:
             output, state_args = model(batch, ret_state=True, skip_state=skip_state)
             preds, batch = output.ress, output.views
-            result = dict(views=batch, pred=preds)
+            bayesian = _unwrap_model(model, accelerator).get_bayesian_stats()
+            result = dict(views=batch, pred=preds, bayesian=bayesian)
             if collect:
                 attn_seq = model.attn_dump_seq
                 return result, state_args, attn_seq
@@ -88,7 +95,8 @@ def loss_of_one_batch(
         with torch.cuda.amp.autocast(enabled=False):
             loss = criterion(batch, preds) if criterion is not None else None
 
-    result = dict(views=batch, pred=preds, loss=loss)
+    bayesian = _unwrap_model(model, accelerator).get_bayesian_stats()
+    result = dict(views=batch, pred=preds, loss=loss, bayesian=bayesian)
     return result[ret] if ret else result
 
 
@@ -216,6 +224,7 @@ def loss_of_one_batch_tbptt(
         views=batch,
         pred=all_preds,
         loss=(all_loss / ((len(batch) - 1) // chunk_size + 1), all_loss_details),
+        bayesian=_unwrap_model(model, accelerator).get_bayesian_stats(),
         already_backprop=True,
     )
     return result[ret] if ret else result

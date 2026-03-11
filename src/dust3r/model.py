@@ -30,6 +30,7 @@ import dust3r.utils.path_to_croco  # noqa: F401
 from models.croco import CroCoNet, CrocoConfig  # noqa
 from dust3r.blocks import (
     Block,
+    BayesianLinear,
     DecoderBlock,
     Mlp,
     Attention,
@@ -116,6 +117,13 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         local_mem_size=256,
         state_pe="2d",
         state_dec_num_heads=16,
+        use_bayesian_decoder=False,
+        bayesian_hidden_dim=None,
+        bayesian_alpha_init=0.1,
+        bayesian_alpha_min=1e-6,
+        bayesian_alpha_max=1.0,
+        bayesian_kl_weight=0.0,
+        bayesian_sample_inference=False,
         depth_head=False,
         rgb_head=False,
         pose_conf_head=False,
@@ -136,6 +144,13 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         self.state_pe = state_pe
         self.state_dec_num_heads = state_dec_num_heads
         self.local_mem_size = local_mem_size
+        self.use_bayesian_decoder = use_bayesian_decoder
+        self.bayesian_hidden_dim = bayesian_hidden_dim
+        self.bayesian_alpha_init = bayesian_alpha_init
+        self.bayesian_alpha_min = bayesian_alpha_min
+        self.bayesian_alpha_max = bayesian_alpha_max
+        self.bayesian_kl_weight = bayesian_kl_weight
+        self.bayesian_sample_inference = bayesian_sample_inference
         self.depth_head = depth_head
         self.rgb_head = rgb_head
         self.pose_conf_head = pose_conf_head
@@ -259,6 +274,10 @@ class ARCroco3DStereo(CroCoNet):
         )
         self.enc_norm_ray_map = nn.LayerNorm(self.enc_embed_dim, eps=1e-6)
         self.dec_num_heads = self.croco_args["dec_num_heads"]
+        self.use_bayesian_decoder = config.use_bayesian_decoder
+        self.bayesian_alpha_min = config.bayesian_alpha_min
+        self.bayesian_alpha_max = config.bayesian_alpha_max
+        self.bayesian_sample_inference = config.bayesian_sample_inference
         self.pose_head_flag = config.pose_head
         if self.pose_head_flag:
             self.pose_token = nn.Parameter(
@@ -293,6 +312,31 @@ class ARCroco3DStereo(CroCoNet):
             self.croco_args.get("norm_layer", None),
             self.croco_args.get("norm_im2_in_dec", None),
         )
+        if self.use_bayesian_decoder:
+            hidden_dim = config.bayesian_hidden_dim or self.dec_embed_dim
+            self.dropout_encoder = nn.Sequential(
+                nn.LayerNorm(self.dec_embed_dim),
+                nn.Linear(self.dec_embed_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, self.dec_depth),
+            )
+            init_bias = torch.log(torch.expm1(torch.tensor(config.bayesian_alpha_init)))
+            nn.init.constant_(self.dropout_encoder[-1].bias, float(init_bias))
+            bayesian_param_counts = [
+                self._count_bayesian_decoder_weights(i) for i in range(self.dec_depth)
+            ]
+            self.register_buffer(
+                "bayesian_decoder_weight_counts",
+                torch.tensor(bayesian_param_counts, dtype=torch.float32),
+                persistent=False,
+            )
+        else:
+            self.dropout_encoder = None
+            self.register_buffer(
+                "bayesian_decoder_weight_counts",
+                torch.zeros(0, dtype=torch.float32),
+                persistent=False,
+            )
         self.set_downstream_head(
             config.output_mode,
             config.head_type,
@@ -311,6 +355,7 @@ class ARCroco3DStereo(CroCoNet):
         # added for attention map visualization
         self.collect_attention = False
         self.attn_dump_seq = None
+        self.reset_bayesian_cache()
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kw):
@@ -469,6 +514,7 @@ class ARCroco3DStereo(CroCoNet):
                 self.register_tokens,
                 self.decoder_embed_state,
                 self.decoder_embed,
+                *([self.dropout_encoder] if self.dropout_encoder is not None else []),
                 self.dec_norm,
                 self.dec_norm_state,
             ],
@@ -477,6 +523,7 @@ class ARCroco3DStereo(CroCoNet):
                 self.dec_blocks_state,
                 self.pose_retriever,
                 self.pose_token,
+                *([self.dropout_encoder] if self.dropout_encoder is not None else []),
             ],
         }
         freeze_all_params(to_be_frozen[freeze])
@@ -665,9 +712,88 @@ class ARCroco3DStereo(CroCoNet):
             shapes.chunk(len(views), dim=0),
             [out.chunk(len(views), dim=0) for out in full_out],
             full_pos.chunk(len(views), dim=0),
-        )    
+        )
 
-    def _decoder(self, f_state, pos_state, f_img, pos_img, f_pose, pos_pose):
+    def reset_bayesian_cache(self):
+        self._bayesian_alpha_history = []
+
+    def _count_bayesian_decoder_weights(self, layer_idx):
+        total = 0
+        layer_modules = [self.dec_blocks_state[layer_idx], self.dec_blocks[layer_idx]]
+        for layer_module in layer_modules:
+            for module in layer_module.modules():
+                if isinstance(module, BayesianLinear):
+                    total += module.weight.numel()
+        return total
+
+    def _pool_state_for_dropout_encoder(self, state_feat):
+        return state_feat.mean(dim=1)
+
+    def _compute_decoder_alpha(self, state_feat):
+        if not self.use_bayesian_decoder:
+            return None
+        pooled_state = self._pool_state_for_dropout_encoder(state_feat)
+        alpha = F.softplus(self.dropout_encoder(pooled_state)) + self.bayesian_alpha_min
+        return torch.clamp(alpha, max=self.bayesian_alpha_max)
+
+    def _should_sample_bayesian(self):
+        if self.training:
+            return True
+        return self.bayesian_sample_inference
+
+    def get_bayesian_stats(self):
+        if not self._bayesian_alpha_history:
+            device = next(self.parameters()).device
+            zero = torch.zeros((), device=device)
+            return {
+                "enabled": False,
+                "kl_loss": zero,
+                "alpha_mean": zero,
+                "alpha_var": zero,
+                "alpha_min": zero,
+                "alpha_max": zero,
+            }
+
+        alpha_hist = torch.stack(self._bayesian_alpha_history, dim=0)
+        beta = alpha_hist.mean(dim=1)
+        gamma = torch.sqrt(alpha_hist.square().mean(dim=1).clamp_min(1e-8))
+        gamma_expanded = gamma.unsqueeze(1)
+        ratio = (alpha_hist / gamma_expanded).clamp_min(1e-8)
+        centered = (alpha_hist - beta.unsqueeze(1)) / gamma_expanded
+        per_layer_kl = (
+            centered.square()
+            + ratio.square()
+            - 1.0
+            - 2.0 * torch.log(ratio)
+        )
+        omega = self.bayesian_decoder_weight_counts.view(1, 1, -1).to(
+            device=alpha_hist.device, dtype=alpha_hist.dtype
+        )
+        kl_loss = (0.5 * omega * per_layer_kl).sum(dim=-1).mean()
+        flat_alpha = alpha_hist.reshape(-1, alpha_hist.shape[-1])
+        return {
+            "enabled": True,
+            "kl_loss": kl_loss,
+            "alpha_mean": flat_alpha.mean(),
+            "alpha_var": flat_alpha.var(unbiased=False),
+            "alpha_min": flat_alpha.min(),
+            "alpha_max": flat_alpha.max(),
+            "alpha_beta": beta,
+            "alpha_gamma": gamma,
+            "omega": self.bayesian_decoder_weight_counts,
+        }
+
+    def _decoder(
+        self,
+        f_state,
+        pos_state,
+        f_img,
+        pos_img,
+        f_pose,
+        pos_pose,
+        decoder_alpha=None,
+        bayesian_sample=None,
+    ):
         final_output = [(f_state, f_img)]  # before projection
         assert f_state.shape[-1] == self.dec_embed_dim
         f_img = self.decoder_embed(f_img)
@@ -688,9 +814,10 @@ class ARCroco3DStereo(CroCoNet):
                 m.cross_attn.collect_attention = True
 
         final_output.append((f_state, f_img))  # embedding한 f_img가 final_output[1]
-        for blk_state, blk_img in zip(
-            self.dec_blocks_state, self.dec_blocks
+        for layer_idx, (blk_state, blk_img) in enumerate(
+            zip(self.dec_blocks_state, self.dec_blocks)
         ):  # decoder block depth만큼 반복
+            layer_alpha = None if decoder_alpha is None else decoder_alpha[:, layer_idx]
             if (
                 self.gradient_checkpointing
                 and self.training
@@ -701,6 +828,7 @@ class ARCroco3DStereo(CroCoNet):
                     *final_output[-1][::+1],  # f_state, f_img
                     pos_state,
                     pos_img,
+                    layer_alpha,
                     use_reentrant=not self.fixed_input_length,
                 )
                 f_img, _ = checkpoint(
@@ -708,11 +836,24 @@ class ARCroco3DStereo(CroCoNet):
                     *final_output[-1][::-1],  # f_img, f_state
                     pos_img,
                     pos_state,
+                    layer_alpha,
                     use_reentrant=not self.fixed_input_length,
                 )
             else:
-                f_state, _ = blk_state(*final_output[-1][::+1], pos_state, pos_img)
-                f_img, _ = blk_img(*final_output[-1][::-1], pos_img, pos_state)
+                f_state, _ = blk_state(
+                    *final_output[-1][::+1],
+                    pos_state,
+                    pos_img,
+                    alpha=layer_alpha,
+                    sample=bayesian_sample,
+                )
+                f_img, _ = blk_img(
+                    *final_output[-1][::-1],
+                    pos_img,
+                    pos_state,
+                    alpha=layer_alpha,
+                    sample=bayesian_sample,
+                )
 
             # --- NEW: collect α after each block ---
             if self.collect_attention:
@@ -772,8 +913,18 @@ class ARCroco3DStereo(CroCoNet):
         reset_mask=None,
         update=None,
     ):
+        decoder_alpha = self._compute_decoder_alpha(state_feat)
+        if decoder_alpha is not None:
+            self._bayesian_alpha_history.append(decoder_alpha)
         new_state_feat, dec = self._decoder(
-            state_feat, state_pos, current_feat, current_pos, pose_feat, pose_pos
+            state_feat,
+            state_pos,
+            current_feat,
+            current_pos,
+            pose_feat,
+            pose_pos,
+            decoder_alpha=decoder_alpha,
+            bayesian_sample=self._should_sample_bayesian(),
         )
         new_state_feat = new_state_feat[-1]
         return new_state_feat, dec
@@ -782,6 +933,7 @@ class ARCroco3DStereo(CroCoNet):
         return torch.mean(feat, dim=1, keepdim=True)
 
     def _forward_encoder(self, views):
+        self.reset_bayesian_cache()
         shape, feat_ls, pos = self._encode_views(views)
         feat = feat_ls[-1]
         state_feat, state_pos = self._init_state(feat[0], pos[0])
@@ -866,6 +1018,7 @@ class ARCroco3DStereo(CroCoNet):
         # initialize attention sequence if collect_attention is True
         if self.collect_attention is True:
             self.attn_dump_seq = []
+        self.reset_bayesian_cache()
 
         shape, feat_ls, pos = self._encode_views(views)
         feat = feat_ls[-1]
@@ -950,6 +1103,7 @@ class ARCroco3DStereo(CroCoNet):
         # initialize attention sequence if collect_attention is True
         if self.collect_attention is True:
             self.attn_dump_seq = []
+        self.reset_bayesian_cache()
 
         shape, feat_ls, pos = self._encode_views(views)
         feat = feat_ls[-1]
@@ -1114,6 +1268,7 @@ class ARCroco3DStereo(CroCoNet):
         return res, view
 
     def forward_recurrent(self, views, device, ret_state=False):
+        self.reset_bayesian_cache()
         ress = []
         all_state_args = []
         for i, view in enumerate(views):
