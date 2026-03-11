@@ -1,0 +1,37 @@
+name: cut3r_124  # 가상환경 이름
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.4
+  - cuda-version=12.4        # 1. 13.2 방어막 설치
+  - cuda-toolkit=12.4  # nvcc 12.4 포함
+  - cuda-nvcc=12.4.131      # 3. nvcc 버전 직접 지정
+  - numpy=1.26.4
+  - pillow=10.3.0
+  - scipy
+  - scikit-learn
+  - matplotlib
+  - tqdm
+  - h5py
+  - pip
+  - pip:
+      - roma
+      - gradio
+      - einops
+      - trimesh
+      - tensorboard
+      - pyglet<2
+      - huggingface-hub[torch]>=0.22
+      - viser
+      - lpips
+      - hydra-core
+      - accelerate
+      - transformers
+      - opencv-python  # conda보다 pip 버전이 서버에서 덜 꼬임

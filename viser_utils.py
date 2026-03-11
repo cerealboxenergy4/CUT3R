@@ -337,7 +337,8 @@ class PointCloudViewer:
         port=8080,
         show_camera=True,
         vis_threshold=1,
-        size=512
+        size=512,
+        downsample_factor=1,
     ):
         self.model = model
         self.size=size
@@ -409,6 +410,13 @@ class PointCloudViewer:
             step=0.01,
             initial_value=0.1,
         )
+        self.downsample_slider = self.server.add_gui_slider(
+            "Downsample Factor",
+            min=1,
+            max=1000,
+            step=1,
+            initial_value=downsample_factor,
+        )
 
         self.pc_handles = []
         self.cam_handles = []
@@ -423,6 +431,41 @@ class PointCloudViewer:
             for handle in self.cam_handles:
                 handle.scale = self.camsize_slider.value
                 handle.line_thickness = 0.03 * handle.scale
+
+        @self.downsample_slider.on_update
+        def _(_) -> None:
+            if hasattr(self, "frame_nodes"):
+                for handle in self.pc_handles:
+                    try:
+                        handle.remove()
+                    except (KeyError, AttributeError):
+                        pass
+                self.pc_handles.clear()
+                self.vis_pts_list.clear()
+
+                for step in self.all_steps:
+                    pc = self.pcs[step]["pc"]
+                    color = self.pcs[step]["color"]
+                    conf = self.pcs[step]["conf"]
+                    edge_color = self.pcs[step].get("edge_color", None)
+
+                    pred_pts, pc_color = self.parse_pc_data(
+                        pc,
+                        color,
+                        conf,
+                        edge_color,
+                        set_border_color=True,
+                        downsample_factor=self.downsample_slider.value,
+                    )
+
+                    self.vis_pts_list.append(pred_pts)
+                    handle = self.server.add_point_cloud(
+                        name=f"/frames/{step}/pred_pts_ds_{self.downsample_slider.value}",
+                        points=pred_pts,
+                        colors=pc_color,
+                        point_size=self.psize_slider.value,
+                    )
+                    self.pc_handles.append(handle)
 
         self.server.on_client_connect(self._connect_client)
 
@@ -626,6 +669,7 @@ class PointCloudViewer:
         conf=None,
         edge_color=[0.251, 0.702, 0.902],
         set_border_color=False,
+        downsample_factor=1,
     ):
 
         pred_pts = pc.reshape(-1, 3)  # [N, 3]
@@ -642,6 +686,12 @@ class PointCloudViewer:
             conf = conf[0].reshape(-1)
             pred_pts = pred_pts[conf > self.vis_threshold]
             color = color[conf > self.vis_threshold]
+
+        if downsample_factor > 1 and len(pred_pts) > 0:
+            indices = np.arange(0, len(pred_pts), downsample_factor)
+            pred_pts = pred_pts[indices]
+            color = color[indices]
+
         return pred_pts, color
 
     def add_pc(self, step):
@@ -651,7 +701,12 @@ class PointCloudViewer:
         edge_color = self.pcs[step].get("edge_color", None)
 
         pred_pts, color = self.parse_pc_data(
-            pc, color, conf, edge_color, set_border_color=True
+            pc,
+            color,
+            conf,
+            edge_color,
+            set_border_color=True,
+            downsample_factor=self.downsample_slider.value,
         )
 
         self.vis_pts_list.append(pred_pts)

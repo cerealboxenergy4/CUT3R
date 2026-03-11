@@ -26,6 +26,7 @@ import cv2
 import argparse
 import tempfile
 import shutil
+import re
 from copy import deepcopy
 from add_ckpt_path import add_path_to_dust3r
 import imageio.v2 as iio
@@ -81,6 +82,18 @@ def parse_args():
         type=str,
         default="./demo_tmp",
         help="value for tempfile.tempdir",
+    )
+    parser.add_argument(
+        "--downsample_factor",
+        type=int,
+        default=1,
+        help="Downsample factor for the point cloud viewer",
+    )
+    parser.add_argument(
+        "--max_len",
+        type=int,
+        default=0,
+        help="Maximum number of input images/frames to load from the start; 0 means no limit",
     )
 
     parser.add_argument(
@@ -385,9 +398,18 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True):
     return pts3ds_other, colors, conf_other, cam_dict
 
 
-def parse_seq_path(p):
+def parse_seq_path(p, max_len=0):
     if os.path.isdir(p):
-        img_paths = sorted(glob.glob(f"{p}/*"))
+        def natural_sort_key(path):
+            name = os.path.basename(path)
+            return [
+                int(part) if part.isdigit() else part.lower()
+                for part in re.split(r"(\d+)", name)
+            ]
+
+        img_paths = sorted(glob.glob(f"{p}/*"), key=natural_sort_key)
+        if max_len > 0:
+            img_paths = img_paths[:max_len]
         tmpdirname = None
     else:
         cap = cv2.VideoCapture(p)
@@ -400,6 +422,8 @@ def parse_seq_path(p):
             raise ValueError(f"Error: Video FPS is 0 for {p}")
         frame_interval = 1
         frame_indices = list(range(0, total_frames, frame_interval))
+        if max_len > 0:
+            frame_indices = frame_indices[:max_len]
         print(
             f" - Video FPS: {video_fps}, Frame Interval: {frame_interval}, Total Frames to Read: {len(frame_indices)}"
         )
@@ -709,7 +733,7 @@ def run_inference(args):
     from src.dust3r.model import ARCroco3DStereo
 
     # Prepare image file paths.
-    img_paths, tmpdirname = parse_seq_path(args.seq_path)
+    img_paths, tmpdirname = parse_seq_path(args.seq_path, args.max_len)
     if not img_paths:
         print(f"No images found in {args.seq_path}. Please verify the path.")
         return
@@ -1044,6 +1068,7 @@ def run_inference(args):
         show_camera=True,
         vis_threshold=args.vis_threshold,
         size=args.size,
+        downsample_factor=args.downsample_factor,
     )
     viewer.run()
 
