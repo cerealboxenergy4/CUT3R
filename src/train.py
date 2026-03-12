@@ -276,16 +276,9 @@ def train(args):
     )
     test_criterion = eval(args.test_criterion or args.criterion).to(device)
 
-    model.to(device)
-
-    if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
-    if args.long_context:
-        model.fixed_input_length = False
-
     if args.pretrained and not args.resume:
         printer.info(f"Loading pretrained: {args.pretrained}")
-        ckpt = torch.load(args.pretrained, map_location=device)
+        ckpt = torch.load(args.pretrained, map_location="cpu")
         load_only_encoder = getattr(args, "load_only_encoder", False)
         if load_only_encoder:
             filtered_state_dict = {
@@ -301,6 +294,13 @@ def train(args):
                 model.load_state_dict(strip_module(ckpt["model"]), strict=False)
             )
         del ckpt  # in case it occupies memory
+
+    model.to(device)
+
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+    if args.long_context:
+        model.fixed_input_length = False
 
     # # following timm: set wd as 0 for bias and norm layers
     param_groups = misc.get_parameter_groups(model, args.weight_decay)
