@@ -135,7 +135,7 @@ def build_logger(args, accelerator):
     tags = getattr(wandb_cfg, "tags", None)
     if isinstance(tags, str):
         tags = [tag for tag in tags.split(",") if tag]
-    run = wandb.init(
+    init_kwargs = dict(
         project=getattr(wandb_cfg, "project", "bayes_cut3r"),
         entity=getattr(wandb_cfg, "entity", None),
         name=getattr(wandb_cfg, "name", None) or args.exp_name,
@@ -144,7 +144,19 @@ def build_logger(args, accelerator):
         mode=getattr(wandb_cfg, "mode", "online"),
         dir=args.output_dir,
         config=cfg_dict,
+        settings=wandb.Settings(init_timeout=getattr(wandb_cfg, "init_timeout", 30)),
     )
+    try:
+        run = wandb.init(**init_kwargs)
+    except Exception as exc:
+        if init_kwargs["mode"] != "online" or not getattr(wandb_cfg, "allow_offline_fallback", True):
+            raise
+        printer.warning(
+            "wandb.init() failed in online mode (%s). Falling back to offline mode.",
+            exc,
+        )
+        init_kwargs["mode"] = "offline"
+        run = wandb.init(**init_kwargs)
     return TrainLogger(
         tensorboard_writer=tensorboard_writer,
         wandb_run=run,
