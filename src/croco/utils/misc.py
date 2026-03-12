@@ -104,6 +104,8 @@ class MetricLogger(object):
             if isinstance(v, list):
                 continue
             assert isinstance(v, (float, int))
+            if not math.isfinite(v):
+                continue
             self.meters[k].update(v)
 
     def __getattr__(self, attr):

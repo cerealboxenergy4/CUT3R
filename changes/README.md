@@ -15,3 +15,4 @@ Chronological list of changes in this repository.
 - 2026-03-12 - Handle scalar pose masks in evaluation loss - changes/2026-03-12_handle-scalar-pose-masks.md
 - 2026-03-12 - Guard evaluation visualization against empty slots - changes/2026-03-12_guard-eval-visualization-empty-slots.md
 - 2026-03-12 - Disable training code snapshot copies - changes/2026-03-12_disable-code-snapshot-copy.md
+- 2026-03-12_02:27:19 - Guard empty-mask NaNs - changes/2026-03-12_02:27:19_guard-empty-mask-nan.md

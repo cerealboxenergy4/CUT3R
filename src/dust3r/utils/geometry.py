@@ -9,6 +9,10 @@ import numpy as np
 from scipy.spatial import cKDTree as KDTree
 
 from dust3r.utils.misc import invalid_to_zeros, invalid_to_nans
+
+
+def _replace_non_finite(tensor, default):
+    return torch.nan_to_num(tensor, nan=default, posinf=default, neginf=default)
 from dust3r.utils.device import to_numpy
 
 
@@ -314,7 +318,7 @@ def normalize_pointcloud(
         else:
             raise ValueError(f"bad {norm_mode=}")
 
-    norm_factor = norm_factor.clip(min=1e-8)
+    norm_factor = _replace_non_finite(norm_factor, 1.0).clip(min=1e-8)
     while norm_factor.ndim < pts1.ndim:
         norm_factor.unsqueeze_(-1)
 
@@ -400,7 +404,7 @@ def normalize_pointcloud_group(
         else:
             raise ValueError(f"bad {norm_mode=}")
 
-    norm_factor = norm_factor.clip(min=1e-8)
+    norm_factor = _replace_non_finite(norm_factor, 1.0).clip(min=1e-8)
     while norm_factor.ndim < pts_list[0].ndim:
         norm_factor.unsqueeze_(-1)
 
@@ -429,7 +433,7 @@ def get_joint_pointcloud_depth(z1, z2, valid_mask1, valid_mask2=None, quantile=0
         shift_z = torch.nanmedian(_z, dim=-1).values
     else:
         shift_z = torch.nanquantile(_z, quantile, dim=-1)
-    return shift_z  # (B,)
+    return _replace_non_finite(shift_z, 0.0)  # (B,)
 
 
 @torch.no_grad()
@@ -445,7 +449,7 @@ def get_group_pointcloud_depth(zs, valid_masks, quantile=0.5):
         shift_z = torch.nanmedian(_z, dim=-1).values
     else:
         shift_z = torch.nanquantile(_z, quantile, dim=-1)
-    return shift_z  # (B,)
+    return _replace_non_finite(shift_z, 0.0)  # (B,)
 
 
 @torch.no_grad()
@@ -467,6 +471,8 @@ def get_joint_pointcloud_center_scale(
 
     _norm = ((_pts - _center) if center else _pts).norm(dim=-1)
     scale = torch.nanmedian(_norm, dim=1).values
+    _center = _replace_non_finite(_center, 0.0)
+    scale = _replace_non_finite(scale, 1.0)
     return _center[:, None, :, :], scale[:, None, None, None]
 
 
@@ -485,6 +491,8 @@ def get_group_pointcloud_center_scale(pts, valid_masks=None, z_only=False, cente
 
     _norm = ((_pts - _center) if center else _pts).norm(dim=-1)
     scale = torch.nanmedian(_norm, dim=1).values
+    _center = _replace_non_finite(_center, 0.0)
+    scale = _replace_non_finite(scale, 1.0)
     return _center[:, None, :, :], scale[:, None, None, None]
 
 
