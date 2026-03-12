@@ -110,7 +110,7 @@ def train(args):
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.accum_iter,
-        mixed_precision="bf16",
+        mixed_precision=getattr(args, "mixed_precision", "bf16"),
         kwargs_handlers=[
             DistributedDataParallelKwargs(find_unused_parameters=True),
             InitProcessGroupKwargs(timeout=timedelta(seconds=6000)),
@@ -129,7 +129,7 @@ def train(args):
         printer.info(f"Saving current code to {dst_dir}")
 
     # auto resume
-    if not args.resume:
+    if args.resume is None and getattr(args, "auto_resume", True):
         last_ckpt_fname = os.path.join(args.output_dir, f"checkpoint-last.pth")
         args.resume = last_ckpt_fname if os.path.isfile(last_ckpt_fname) else None
 

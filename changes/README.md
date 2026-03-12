@@ -10,3 +10,4 @@ Chronological list of changes in this repository.
 - 2026-03-12 - Fix KITTI resolution handling in Hydra config - changes/2026-03-12_fix-kitti-resolution-hydra-string.md
 - 2026-03-12 - Fix patch embed input dtype - changes/2026-03-12_fix-patch-embed-input-dtype.md
 - 2026-03-12 - Disable AMP during evaluation forward - changes/2026-03-12_disable-amp-during-eval.md
+- 2026-03-12 - Control auto-resume and mixed precision - changes/2026-03-12_control-auto-resume-and-mixed-precision.md

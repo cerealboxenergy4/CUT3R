@@ -4,6 +4,7 @@ load_only_encoder: False
 long_context: False
 fixed_length: True
 resume: null
+auto_resume: false
 benchmark: False
 num_views: 4
 num_test_views: 4
@@ -30,6 +31,7 @@ lr: 1e-6
 min_lr: 1e-7
 warmup_epochs: 0.25
 amp: 1
+mixed_precision: 'no'
 
 num_workers: 4
 world_size: 1
