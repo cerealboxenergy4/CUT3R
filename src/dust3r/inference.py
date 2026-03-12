@@ -78,7 +78,8 @@ def loss_of_one_batch(
     if symmetrize_batch:
         batch = make_batch_symmetric(batch)
 
-    with torch.cuda.amp.autocast(enabled=not inference):
+    autocast_enabled = bool(use_amp) and (not inference) and model.training
+    with torch.cuda.amp.autocast(enabled=autocast_enabled):
         if inference:
             output, state_args = model(batch, ret_state=True, skip_state=skip_state)
             preds, batch = output.ress, output.views
@@ -124,7 +125,8 @@ def loss_of_one_batch_tbptt(
     all_preds = []
     all_loss = 0.0
     all_loss_details = {}
-    with torch.cuda.amp.autocast(enabled=not inference):
+    autocast_enabled = bool(use_amp) and (not inference) and model.training
+    with torch.cuda.amp.autocast(enabled=autocast_enabled):
         with torch.no_grad():
             (feat, pos, shape), (
                 init_state_feat,
