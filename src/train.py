@@ -59,6 +59,99 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 printer = get_logger(__name__, log_level="DEBUG")
 
 
+class TrainLogger:
+    def __init__(self, tensorboard_writer=None, wandb_run=None, wandb_module=None):
+        self.tensorboard_writer = tensorboard_writer
+        self.wandb_run = wandb_run
+        self.wandb = wandb_module
+        if tensorboard_writer is not None:
+            self.log_dir = tensorboard_writer.log_dir
+        elif wandb_run is not None:
+            self.log_dir = getattr(wandb_run, "dir", "")
+        else:
+            self.log_dir = ""
+
+    def add_scalar(self, name, value, step):
+        if self.tensorboard_writer is not None:
+            self.tensorboard_writer.add_scalar(name, value, step)
+        if self.wandb_run is not None and isinstance(value, (float, int)) and math.isfinite(value):
+            self.wandb_run.log({name: value}, step=step)
+
+    def add_images(self, name, images, step, dataformats="HWC"):
+        if self.tensorboard_writer is not None:
+            self.tensorboard_writer.add_images(name, images, step, dataformats=dataformats)
+        if self.wandb_run is None:
+            return
+        if isinstance(images, torch.Tensor):
+            image_array = images.detach().cpu()
+            if image_array.ndim > 3:
+                image_array = image_array[0]
+            image_array = image_array.numpy()
+        else:
+            image_array = np.asarray(images)
+            if image_array.ndim > 3:
+                image_array = image_array[0]
+        self.wandb_run.log({name: self.wandb.Image(image_array)}, step=step)
+
+    def log_metrics(self, metrics, step):
+        if self.wandb_run is None:
+            return
+        payload = {
+            key: value
+            for key, value in metrics.items()
+            if isinstance(value, (float, int)) and math.isfinite(value)
+        }
+        if payload:
+            self.wandb_run.log(payload, step=step)
+
+    def flush(self):
+        if self.tensorboard_writer is not None:
+            self.tensorboard_writer.flush()
+
+    def close(self):
+        if self.tensorboard_writer is not None:
+            self.tensorboard_writer.close()
+        if self.wandb_run is not None:
+            self.wandb_run.finish()
+
+
+def build_logger(args, accelerator):
+    if not accelerator.is_main_process:
+        return None
+
+    tensorboard_writer = SummaryWriter(log_dir=args.output_dir)
+    wandb_cfg = getattr(args, "wandb", None)
+    if not getattr(wandb_cfg, "enabled", False):
+        return TrainLogger(tensorboard_writer=tensorboard_writer)
+
+    try:
+        import wandb
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "wandb logging is enabled but the 'wandb' package is not installed in the current environment."
+        ) from exc
+
+    cfg_dict = OmegaConf.to_container(args, resolve=True)
+    tags = getattr(wandb_cfg, "tags", None)
+    if isinstance(tags, str):
+        tags = [tag for tag in tags.split(",") if tag]
+    run = wandb.init(
+        project=getattr(wandb_cfg, "project", "bayes_cut3r"),
+        entity=getattr(wandb_cfg, "entity", None),
+        name=getattr(wandb_cfg, "name", None) or args.exp_name,
+        group=getattr(wandb_cfg, "group", None),
+        tags=tags,
+        mode=getattr(wandb_cfg, "mode", "online"),
+        dir=args.output_dir,
+        config=cfg_dict,
+    )
+    return TrainLogger(
+        tensorboard_writer=tensorboard_writer,
+        wandb_run=run,
+        wandb_module=wandb,
+    )
+
+
 def setup_for_distributed(accelerator: Accelerator):
     """
     This function disables printing when not in master process
@@ -222,8 +315,8 @@ def train(args):
 
     def write_log_stats(epoch, train_stats, test_stats):
         if accelerator.is_main_process:
-            if log_writer is not None:
-                log_writer.flush()
+            if logger is not None:
+                logger.flush()
 
             log_stats = dict(
                 epoch=epoch, **{f"train_{k}": v for k, v in train_stats.items()}
@@ -239,6 +332,8 @@ def train(args):
                 os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8"
             ) as f:
                 f.write(json.dumps(log_stats) + "\n")
+            if logger is not None:
+                logger.log_metrics(log_stats, step=epoch)
 
     def save_model(epoch, fname, best_so_far):
         misc.save_model(
@@ -257,9 +352,7 @@ def train(args):
     )
     if best_so_far is None:
         best_so_far = float("inf")
-    log_writer = (
-        SummaryWriter(log_dir=args.output_dir) if accelerator.is_main_process else None
-    )
+    logger = build_logger(args, accelerator)
 
     printer.info(f"Start training for {args.epochs} epochs")
     start_time = time.time()
@@ -288,7 +381,7 @@ def train(args):
                     accelerator,
                     device,
                     epoch,
-                    log_writer=log_writer,
+                    log_writer=logger,
                     args=args,
                     prefix=test_name,
                 )
@@ -318,13 +411,15 @@ def train(args):
             accelerator,
             epoch,
             loss_scaler,
-            log_writer=log_writer,
+            log_writer=logger,
             args=args,
         )
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     printer.info("Training time {}".format(total_time_str))
+    if logger is not None:
+        logger.close()
 
     save_final_model(accelerator, args, args.epochs, model, best_so_far=best_so_far)
 
