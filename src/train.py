@@ -124,10 +124,6 @@ def train(args):
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
-    if accelerator.is_main_process:
-        dst_dir = save_current_code(outdir=args.output_dir)
-        printer.info(f"Saving current code to {dst_dir}")
-
     # auto resume
     if args.resume is None and getattr(args, "auto_resume", True):
         last_ckpt_fname = os.path.join(args.output_dir, f"checkpoint-last.pth")
