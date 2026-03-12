@@ -13,8 +13,7 @@ n_corres_test: 0
 train_criterion: ConfLoss(Regr3DPoseBatchList(L21, norm_mode='?avg_dis'), alpha=0.2) + RGBLoss(MSE)
 test_criterion: Regr3DPose(L21, norm_mode='?avg_dis', gt_scale=True, sky_loss_value=0) + Regr3DPose_ScaleInv(L21, norm_mode='?avg_dis', gt_scale=True, sky_loss_value=0) + RGBLoss(L21)
 
-kitti_resolution: [(512, 384), (512, 336), (512, 288), (512, 256)]
-kitti_train: KITTIOdometry_Multi(split=None, ROOT='../../datasets/kitti_odometry', sequences=('01','02','03','04','05','06','07','08','09','10'), camera='image_2', max_interval=5, resolution=${kitti_resolution}, transform=SeqColorJitter, num_views=${num_views}, n_corres=${n_corres_train})
+kitti_train: KITTIOdometry_Multi(split=None, ROOT='../../datasets/kitti_odometry', sequences=('01','02','03','04','05','06','07','08','09','10'), camera='image_2', max_interval=5, resolution=[(512, 384), (512, 336), (512, 288), (512, 256)], transform=SeqColorJitter, num_views=${num_views}, n_corres=${n_corres_train})
 kitti_test: KITTIOdometry_Multi(split=None, ROOT='../../datasets/kitti_odometry', sequences=('00',), camera='image_2', max_interval=3, resolution=(512, 384), transform=SeqColorJitter, num_views=${num_test_views}, n_corres=${n_corres_test}, seed=42)
 
 train_dataset: 20000 @ ${kitti_train}

@@ -7,3 +7,4 @@ Chronological list of changes in this repository.
 - 2026-03-11 - Fix demo KITTI sequence input handling - changes/2026-03-11_fix-demo-kitti-sequence-input.md
 - 2026-03-12 - Split KITTI PoC train and eval sequences - changes/2026-03-12_split-kitti-poc-train-eval.md
 - 2026-03-12 - Align environment for gsplat support - changes/2026-03-12_align-environment-for-gsplat.md
+- 2026-03-12 - Fix KITTI resolution handling in Hydra config - changes/2026-03-12_fix-kitti-resolution-hydra-string.md
