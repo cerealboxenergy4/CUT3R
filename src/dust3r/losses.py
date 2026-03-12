@@ -744,18 +744,29 @@ class Regr3DPose(Criterion, MultiLoss):
         gt_quats = torch.stack([gt[1] for gt in gt_poses], dim=1)  # BXNX3
         pred_trans = torch.stack([pr[0] for pr in pred_poses], dim=1)  # BxNx4
         pred_quats = torch.stack([pr[1] for pr in pred_poses], dim=1)  # BxNx4
-        if masks == None:
+        if masks is None:
             pose_loss = (
                 torch.norm(pred_trans - gt_trans, dim=-1).mean()
                 + torch.norm(pred_quats - gt_quats, dim=-1).mean()
             )
         else:
-            if not any(masks):
-                return torch.tensor(0.0)
-            pose_loss = (
-                torch.norm(pred_trans - gt_trans, dim=-1)[masks].mean()
-                + torch.norm(pred_quats - gt_quats, dim=-1)[masks].mean()
-            )
+            if torch.is_tensor(masks) and masks.ndim == 0:
+                if not bool(masks.item()):
+                    return pred_trans.new_zeros(())
+                masks = None
+            elif not any(masks):
+                return pred_trans.new_zeros(())
+
+            if masks is None:
+                pose_loss = (
+                    torch.norm(pred_trans - gt_trans, dim=-1).mean()
+                    + torch.norm(pred_quats - gt_quats, dim=-1).mean()
+                )
+            else:
+                pose_loss = (
+                    torch.norm(pred_trans - gt_trans, dim=-1)[masks].mean()
+                    + torch.norm(pred_quats - gt_quats, dim=-1)[masks].mean()
+                )
 
         return pose_loss
 
