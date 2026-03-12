@@ -1,6 +1,7 @@
 import tqdm
 import torch
 from dust3r.utils.device import to_cpu, collate_with_cat
+from dust3r.utils.device import to_device
 from dust3r.utils.misc import invalid_to_nans
 from dust3r.utils.geometry import depthmap_to_pts3d, geotrf
 from dust3r.model import ARCroco3DStereo
@@ -77,6 +78,8 @@ def loss_of_one_batch(
         ), "cannot symmetrize batch with more than 2 views"
     if symmetrize_batch:
         batch = make_batch_symmetric(batch)
+    if accelerator is not None:
+        batch = to_device(batch, accelerator.device, non_blocking=True)
 
     autocast_enabled = bool(use_amp) and (not inference) and model.training
     with torch.cuda.amp.autocast(enabled=autocast_enabled):
@@ -122,6 +125,8 @@ def loss_of_one_batch_tbptt(
         ), "cannot symmetrize batch with more than 2 views"
     if symmetrize_batch:
         batch = make_batch_symmetric(batch)
+    if accelerator is not None:
+        batch = to_device(batch, accelerator.device, non_blocking=True)
     all_preds = []
     all_loss = 0.0
     all_loss_details = {}
