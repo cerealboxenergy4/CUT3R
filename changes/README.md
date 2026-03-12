@@ -22,3 +22,4 @@ Chronological list of changes in this repository.
 - 2026-03-12_04:50:18 - Load pretrained on CPU for multi-GPU - changes/2026-03-12_04:50:18_load-pretrained-on-cpu-for-multigpu.md
 - 2026-03-12_04:53:58 - Add W&B timeout and offline fallback - changes/2026-03-12_04:53:58_add-wandb-timeout-offline-fallback.md
 - 2026-03-12_04:29:44 - Enable W&B in KITTI PoC config - changes/2026-03-12_04:29:44_enable-wandb-in-kitti-poc-config.md
+- 2026-03-12_06:04:03 - Add multi-GPU init debug logs - changes/2026-03-12_06:04:03_add-multigpu-init-debug-logs.md

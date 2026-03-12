@@ -321,8 +321,16 @@ def train(args):
     loss_scaler = NativeScaler(accelerator=accelerator)
 
     accelerator.even_batches = False
+    printer.info(
+        "[RANK %s] Starting accelerator.prepare()",
+        accelerator.process_index,
+    )
     optimizer, model, data_loader_train = accelerator.prepare(
         optimizer, model, data_loader_train
+    )
+    printer.info(
+        "[RANK %s] Finished accelerator.prepare()",
+        accelerator.process_index,
     )
 
     def write_log_stats(epoch, train_stats, test_stats):
@@ -359,12 +367,16 @@ def train(args):
             best_so_far=best_so_far,
         )
 
+    printer.info("[RANK %s] Loading resume state", accelerator.process_index)
     best_so_far = misc.load_model(
         args=args, model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler
     )
+    printer.info("[RANK %s] Resume state ready", accelerator.process_index)
     if best_so_far is None:
         best_so_far = float("inf")
+    printer.info("[RANK %s] Building experiment logger", accelerator.process_index)
     logger = build_logger(args, accelerator)
+    printer.info("[RANK %s] Logger ready", accelerator.process_index)
 
     printer.info(f"Start training for {args.epochs} epochs")
     start_time = time.time()
