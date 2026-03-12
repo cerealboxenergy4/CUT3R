@@ -19,3 +19,4 @@ Chronological list of changes in this repository.
 - 2026-03-12_02:39:04 - Sanitize NaN head postprocess - changes/2026-03-12_02:39:04_sanitize-nan-head-postprocess.md
 - 2026-03-12_04:12:54 - Restore per-view pose supervision - changes/2026-03-12_04:12:54_restore-per-view-pose-supervision.md
 - 2026-03-12_04:24:57 - Add optional W&B logging - changes/2026-03-12_04:24:57_add-optional-wandb-logging.md
+- 2026-03-12_04:29:44 - Enable W&B in KITTI PoC config - changes/2026-03-12_04:29:44_enable-wandb-in-kitti-poc-config.md
