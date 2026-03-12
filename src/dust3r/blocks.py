@@ -58,21 +58,30 @@ class DropPath(nn.Module):
 
 
 class BayesianLinear(nn.Linear):
+    def __init__(self, *args, sigma=1e-3, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sigma = float(sigma)
+
     def forward(self, input, alpha=None, sample=None):
-        mean = F.linear(input, self.weight, self.bias)
+        weight_mean = F.linear(input, self.weight, None)
         if alpha is None:
-            return mean
+            return weight_mean if self.bias is None else weight_mean + self.bias
 
         sample = self.training if sample is None else sample
+        alpha = torch.as_tensor(alpha, dtype=weight_mean.dtype, device=weight_mean.device)
+        alpha = torch.clamp_min(alpha, 0.0)
+        while alpha.ndim < weight_mean.ndim:
+            alpha = alpha.unsqueeze(-1)
+
+        mean = weight_mean * alpha
+        if self.bias is not None:
+            mean = mean + self.bias
+
         if not sample:
             return mean
 
         variance = F.linear(input.square(), self.weight.square(), None)
-        alpha = torch.as_tensor(alpha, dtype=variance.dtype, device=variance.device)
-        alpha = torch.clamp_min(alpha, 0.0)
-        while alpha.ndim < variance.ndim:
-            alpha = alpha.unsqueeze(-1)
-        variance = variance * alpha
+        variance = variance * alpha.square() * (self.sigma ** 2)
         noise = torch.randn_like(mean)
         return mean + noise * torch.sqrt(torch.clamp_min(variance, 1e-8))
 

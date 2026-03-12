@@ -122,6 +122,7 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         bayesian_alpha_init=0.1,
         bayesian_alpha_min=1e-6,
         bayesian_alpha_max=1.0,
+        bayesian_sigma=1e-3,
         bayesian_kl_weight=0.0,
         bayesian_sample_inference=False,
         depth_head=False,
@@ -149,6 +150,7 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         self.bayesian_alpha_init = bayesian_alpha_init
         self.bayesian_alpha_min = bayesian_alpha_min
         self.bayesian_alpha_max = bayesian_alpha_max
+        self.bayesian_sigma = bayesian_sigma
         self.bayesian_kl_weight = bayesian_kl_weight
         self.bayesian_sample_inference = bayesian_sample_inference
         self.depth_head = depth_head
@@ -275,8 +277,10 @@ class ARCroco3DStereo(CroCoNet):
         self.enc_norm_ray_map = nn.LayerNorm(self.enc_embed_dim, eps=1e-6)
         self.dec_num_heads = self.croco_args["dec_num_heads"]
         self.use_bayesian_decoder = config.use_bayesian_decoder
+        self.bayesian_alpha_init = config.bayesian_alpha_init
         self.bayesian_alpha_min = config.bayesian_alpha_min
         self.bayesian_alpha_max = config.bayesian_alpha_max
+        self.bayesian_sigma = config.bayesian_sigma
         self.bayesian_sample_inference = config.bayesian_sample_inference
         self.pose_head_flag = config.pose_head
         if self.pose_head_flag:
@@ -320,8 +324,7 @@ class ARCroco3DStereo(CroCoNet):
                 nn.GELU(),
                 nn.Linear(hidden_dim, self.dec_depth),
             )
-            init_bias = torch.log(torch.expm1(torch.tensor(config.bayesian_alpha_init)))
-            nn.init.constant_(self.dropout_encoder[-1].bias, float(init_bias))
+            self.reset_bayesian_dropout_encoder()
             bayesian_param_counts = [
                 self._count_bayesian_decoder_weights(i) for i in range(self.dec_depth)
             ]
@@ -474,6 +477,15 @@ class ARCroco3DStereo(CroCoNet):
 
     def set_freeze(self, freeze):  # this is for use by downstream models
         self.freeze = freeze
+        if freeze == "dropout_encoder_only":
+            freeze_all_params([self])
+            if self.dropout_encoder is None:
+                raise ValueError(
+                    "freeze='dropout_encoder_only' requires use_bayesian_decoder=True"
+                )
+            for param in self.dropout_encoder.parameters():
+                param.requires_grad = True
+            return
         to_be_frozen = {
             "none": [],
             "mask": [self.mask_token] if hasattr(self, "mask_token") else [],
@@ -526,6 +538,8 @@ class ARCroco3DStereo(CroCoNet):
                 *([self.dropout_encoder] if self.dropout_encoder is not None else []),
             ],
         }
+        if freeze not in to_be_frozen:
+            raise ValueError(f"Unknown freeze mode: {freeze}")
         freeze_all_params(to_be_frozen[freeze])
 
     def _set_prediction_head(self, *args, **kwargs):
@@ -713,6 +727,38 @@ class ARCroco3DStereo(CroCoNet):
             [out.chunk(len(views), dim=0) for out in full_out],
             full_pos.chunk(len(views), dim=0),
         )
+
+    def _validate_bayesian_alpha_config(self):
+        if not (self.bayesian_alpha_min <= self.bayesian_alpha_init <= self.bayesian_alpha_max):
+            raise ValueError(
+                "Bayesian alpha config must satisfy "
+                f"min <= init <= max, got {self.bayesian_alpha_min}, "
+                f"{self.bayesian_alpha_init}, {self.bayesian_alpha_max}"
+            )
+        target = self.bayesian_alpha_init - self.bayesian_alpha_min
+        if target <= 0:
+            raise ValueError(
+                "bayesian_alpha_init must be strictly greater than bayesian_alpha_min "
+                "for softplus initialization"
+            )
+        return target
+
+    def _set_bayesian_sigma(self):
+        for module in self.modules():
+            if isinstance(module, BayesianLinear):
+                module.sigma = float(self.bayesian_sigma)
+
+    def reset_bayesian_dropout_encoder(self):
+        if not self.use_bayesian_decoder or self.dropout_encoder is None:
+            return
+        target = self._validate_bayesian_alpha_config()
+        self.dropout_encoder[0].reset_parameters()
+        self.dropout_encoder[1].reset_parameters()
+        self.dropout_encoder[3].reset_parameters()
+        nn.init.zeros_(self.dropout_encoder[3].weight)
+        init_bias = torch.log(torch.expm1(torch.tensor(target)))
+        nn.init.constant_(self.dropout_encoder[3].bias, float(init_bias))
+        self._set_bayesian_sigma()
 
     def reset_bayesian_cache(self):
         self._bayesian_alpha_history = []

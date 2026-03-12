@@ -306,6 +306,9 @@ def train(args):
                 model.load_state_dict(strip_module(ckpt["model"]), strict=False)
             )
         del ckpt  # in case it occupies memory
+    if getattr(args, "reset_bayesian_dropout_encoder", False):
+        printer.info("Resetting bayesian dropout encoder after model load")
+        model.reset_bayesian_dropout_encoder()
 
     model.to(device)
 
