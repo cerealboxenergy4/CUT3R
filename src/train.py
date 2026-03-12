@@ -778,6 +778,8 @@ def vis_and_cat(
         ),
         append_cbar=True,
     )
+    cross_conf_vis = torch.zeros_like(cross_gt_depths_vis)
+    self_conf_vis = torch.zeros_like(cross_gt_depths_vis)
     if len(cross_conf) > 0:
         cross_conf_vis = colorize(cross_conf, append_cbar=True)
     if len(self_conf) > 0:
@@ -904,36 +906,48 @@ def get_vis_imgs_new(loss_details, num_imgs_vis, num_views, is_metric):
             loss_details[f"ray_mask_{i+1}"][:num_imgs_vis].detach().cpu().unbind(dim=0),
         )
 
-    # each element in the list is [H, num_views * W, (3)], the size of the list is num_imgs_vis
-    gt_img_list = [torch.cat(sublist, dim=1) for sublist in gt_img_list]
-    pred_img_list = [torch.cat(sublist, dim=1) for sublist in pred_img_list]
+    valid_indices = [idx for idx, sublist in enumerate(gt_img_list) if len(sublist) > 0]
+    if not valid_indices:
+        return ret_dict
+
+    # each element in the list is [H, num_views * W, (3)], the size of the list is the number of valid images
+    gt_img_list = [torch.cat(gt_img_list[idx], dim=1) for idx in valid_indices]
+    pred_img_list = [torch.cat(pred_img_list[idx], dim=1) for idx in valid_indices]
     cross_pred_depth_list = [
-        torch.cat(sublist, dim=1) for sublist in cross_pred_depth_list
+        torch.cat(cross_pred_depth_list[idx], dim=1) for idx in valid_indices
     ]
-    cross_gt_depth_list = [torch.cat(sublist, dim=1) for sublist in cross_gt_depth_list]
-    self_gt_depth_list = [torch.cat(sublist, dim=1) for sublist in self_gt_depth_list]
+    cross_gt_depth_list = [
+        torch.cat(cross_gt_depth_list[idx], dim=1) for idx in valid_indices
+    ]
+    self_gt_depth_list = [
+        torch.cat(self_gt_depth_list[idx], dim=1) for idx in valid_indices
+    ]
     self_pred_depth_list = [
-        torch.cat(sublist, dim=1) for sublist in self_pred_depth_list
+        torch.cat(self_pred_depth_list[idx], dim=1) for idx in valid_indices
     ]
-    cross_view_conf_list = (
-        [torch.cat(sublist, dim=1) for sublist in cross_view_conf_list]
-        if cross_view_conf_exits
-        else []
-    )
-    self_view_conf_list = (
-        [torch.cat(sublist, dim=1) for sublist in self_view_conf_list]
-        if self_view_conf_exits
-        else []
-    )
-    # each elment in the list is [num_views,], the size of the list is num_imgs_vis
-    img_mask_list = [torch.stack(sublist, dim=0) for sublist in img_mask_list]
-    ray_mask_list = [torch.stack(sublist, dim=0) for sublist in ray_mask_list]
+    if cross_view_conf_exits:
+        cross_view_conf_list = [
+            torch.cat(cross_view_conf_list[idx], dim=1) if len(cross_view_conf_list[idx]) > 0 else []
+            for idx in valid_indices
+        ]
+    else:
+        cross_view_conf_list = [[] for _ in valid_indices]
+    if self_view_conf_exits:
+        self_view_conf_list = [
+            torch.cat(self_view_conf_list[idx], dim=1) if len(self_view_conf_list[idx]) > 0 else []
+            for idx in valid_indices
+        ]
+    else:
+        self_view_conf_list = [[] for _ in valid_indices]
+    # each element in the list is [num_views,], the size of the list is the number of valid images
+    img_mask_list = [torch.stack(img_mask_list[idx], dim=0) for idx in valid_indices]
+    ray_mask_list = [torch.stack(ray_mask_list[idx], dim=0) for idx in valid_indices]
 
     ray_indicator = gen_mask_indicator(
         img_mask_list, ray_mask_list, len(img_mask_list[0]), 30, width
     )
 
-    for i in range(num_imgs_vis):
+    for i in range(len(valid_indices)):
         out = vis_and_cat(
             gt_img_list[i],
             pred_img_list[i],

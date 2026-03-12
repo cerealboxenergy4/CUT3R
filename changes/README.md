@@ -13,3 +13,4 @@ Chronological list of changes in this repository.
 - 2026-03-12 - Control auto-resume and mixed precision - changes/2026-03-12_control-auto-resume-and-mixed-precision.md
 - 2026-03-12 - Move inference batches to the accelerator device - changes/2026-03-12_move-batches-to-accelerator-device.md
 - 2026-03-12 - Handle scalar pose masks in evaluation loss - changes/2026-03-12_handle-scalar-pose-masks.md
+- 2026-03-12 - Guard evaluation visualization against empty slots - changes/2026-03-12_guard-eval-visualization-empty-slots.md
