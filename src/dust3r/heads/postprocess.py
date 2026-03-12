@@ -8,11 +8,23 @@ import torch
 import torch.nn.functional as F
 
 
+def _sanitize_tensor(x, default=0.0):
+    return torch.nan_to_num(x, nan=default, posinf=default, neginf=default)
+
+
+def _sanitize_quaternion(quats):
+    quats = _sanitize_tensor(quats, default=0.0)
+    invalid = quats.norm(dim=-1, keepdim=True) < 1e-8
+    identity = torch.zeros_like(quats)
+    identity[..., 0] = 1.0
+    return torch.where(invalid, identity, quats)
+
+
 def postprocess(out, depth_mode, conf_mode, pos_z=False):
     """
     extract 3D points/confidence from prediction head output
     """
-    fmap = out.permute(0, 2, 3, 1)  # B,H,W,3
+    fmap = _sanitize_tensor(out).permute(0, 2, 3, 1)  # B,H,W,3
     res = dict(pts3d=reg_dense_depth(fmap[:, :, :, 0:3], mode=depth_mode, pos_z=pos_z))
 
     if conf_mode is not None:
@@ -21,10 +33,10 @@ def postprocess(out, depth_mode, conf_mode, pos_z=False):
 
 
 def postprocess_rgb(out, eps=1e-6):
-    fmap = out.permute(0, 2, 3, 1)  # B,H,W,3
+    fmap = _sanitize_tensor(out).permute(0, 2, 3, 1)  # B,H,W,3
     res = torch.sigmoid(fmap) * (1 - 2 * eps) + eps
     res = (res - 0.5) * 2
-    return dict(rgb=res)
+    return dict(rgb=_sanitize_tensor(res))
 
 
 def postprocess_pose(out, mode, inverse=False):
@@ -35,8 +47,9 @@ def postprocess_pose(out, mode, inverse=False):
 
     no_bounds = (vmin == -float("inf")) and (vmax == float("inf"))
     assert no_bounds
+    out = _sanitize_tensor(out)
     trans = out[..., 0:3]
-    quats = out[..., 3:7]
+    quats = _sanitize_quaternion(out[..., 3:7])
 
     if mode == "linear":
         if no_bounds:
@@ -60,19 +73,19 @@ def postprocess_pose(out, mode, inverse=False):
     trans = trans * scale
     quats = standardize_quaternion(quats)
 
-    return torch.cat([trans, quats], dim=-1)
+    return _sanitize_tensor(torch.cat([trans, quats], dim=-1))
 
 
 def postprocess_pose_conf(out):
-    fmap = out.permute(0, 2, 3, 1)  # B,H,W,1
-    return dict(pose_conf=torch.sigmoid(fmap))
+    fmap = _sanitize_tensor(out).permute(0, 2, 3, 1)  # B,H,W,1
+    return dict(pose_conf=_sanitize_tensor(torch.sigmoid(fmap)))
 
 
 def postprocess_desc(out, depth_mode, conf_mode, desc_dim, double_channel=False):
     """
     extract 3D points/confidence from prediction head output
     """
-    fmap = out.permute(0, 2, 3, 1)  # B,H,W,3
+    fmap = _sanitize_tensor(out).permute(0, 2, 3, 1)  # B,H,W,3
     res = dict(pts3d=reg_dense_depth(fmap[:, :, :, 0:3], mode=depth_mode))
 
     if conf_mode is not None:
@@ -104,10 +117,10 @@ def postprocess_desc(out, depth_mode, conf_mode, desc_dim, double_channel=False)
 
 def reg_desc(desc, mode="norm"):
     if "norm" in mode:
-        desc = desc / desc.norm(dim=-1, keepdim=True)
+        desc = desc / desc.norm(dim=-1, keepdim=True).clamp(min=1e-8)
     else:
         raise ValueError(f"Unknown desc mode {mode}")
-    return desc
+    return _sanitize_tensor(desc)
 
 
 def reg_dense_depth(xyz, mode, pos_z=False):
@@ -121,8 +134,8 @@ def reg_dense_depth(xyz, mode, pos_z=False):
 
     if mode == "linear":
         if no_bounds:
-            return xyz  # [-inf, +inf]
-        return xyz.clip(min=vmin, max=vmax)
+            return _sanitize_tensor(xyz)  # [-inf, +inf]
+        return _sanitize_tensor(xyz.clip(min=vmin, max=vmax))
 
     if pos_z:
         sign = torch.sign(xyz[..., -1:])
@@ -131,10 +144,10 @@ def reg_dense_depth(xyz, mode, pos_z=False):
     xyz = xyz / d.clip(min=1e-8)
 
     if mode == "square":
-        return xyz * d.square()
+        return _sanitize_tensor(xyz * d.square())
 
     if mode == "exp":
-        return xyz * torch.expm1(d)
+        return _sanitize_tensor(xyz * torch.expm1(d))
 
     raise ValueError(f"bad {mode=}")
 
@@ -145,9 +158,11 @@ def reg_dense_conf(x, mode):
     """
     mode, vmin, vmax = mode
     if mode == "exp":
-        return vmin + x.exp().clip(max=vmax - vmin)
+        x = _sanitize_tensor(x)
+        return _sanitize_tensor(vmin + x.exp().clip(max=vmax - vmin), default=vmin)
     if mode == "sigmoid":
-        return (vmax - vmin) * torch.sigmoid(x) + vmin
+        x = _sanitize_tensor(x)
+        return _sanitize_tensor((vmax - vmin) * torch.sigmoid(x) + vmin, default=vmin)
     raise ValueError(f"bad {mode=}")
 
 
@@ -163,5 +178,6 @@ def standardize_quaternion(quaternions: torch.Tensor) -> torch.Tensor:
     Returns:
         Standardized quaternions as tensor of shape (..., 4).
     """
-    quaternions = F.normalize(quaternions, p=2, dim=-1)
+    quaternions = F.normalize(quaternions, p=2, dim=-1, eps=1e-8)
+    quaternions = _sanitize_quaternion(quaternions)
     return torch.where(quaternions[..., 0:1] < 0, -quaternions, quaternions)
