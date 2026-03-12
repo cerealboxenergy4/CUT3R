@@ -24,6 +24,7 @@ class PatchEmbedDust3R(PatchEmbed):
         assert (
             W % self.patch_size[1] == 0
         ), f"Input image width ({W}) is not a multiple of patch size ({self.patch_size[1]})."
+        x = x.to(dtype=self.proj.weight.dtype)
         x = self.proj(x)
         pos = self.position_getter(B, x.size(2), x.size(3), x.device)
         if self.flatten:
@@ -63,6 +64,7 @@ class ManyAR_PatchEmbed(PatchEmbed):
             B,
             2,
         ), f"true_shape has the wrong shape={true_shape.shape}"
+        img = img.to(dtype=self.proj.weight.dtype)
 
         W //= self.patch_size[0]
         H //= self.patch_size[1]
