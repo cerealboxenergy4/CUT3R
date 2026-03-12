@@ -758,7 +758,7 @@ class Regr3DPose(Criterion, MultiLoss):
         """
         gt_pose: list of (Bx3, Bx4)
         pred_pose: list of (Bx3, Bx4)
-        masks: None, or B
+        masks: None, B, or BxN
         """
         gt_trans = torch.stack([gt[0] for gt in gt_poses], dim=1)  # BxNx3
         gt_quats = torch.stack([gt[1] for gt in gt_poses], dim=1)  # BXNX3
@@ -774,6 +774,11 @@ class Regr3DPose(Criterion, MultiLoss):
                 if not bool(masks.item()):
                     return pred_trans.new_zeros(())
                 masks = None
+            elif torch.is_tensor(masks):
+                if masks.ndim == 1 and not bool(masks.any()):
+                    return pred_trans.new_zeros(())
+                if masks.ndim == 2 and not bool(masks.any()):
+                    return pred_trans.new_zeros(())
             elif not any(masks):
                 return pred_trans.new_zeros(())
 
@@ -783,10 +788,9 @@ class Regr3DPose(Criterion, MultiLoss):
                     + torch.norm(pred_quats - gt_quats, dim=-1).mean()
                 )
             else:
-                pose_loss = (
-                    torch.norm(pred_trans - gt_trans, dim=-1)[masks].mean()
-                    + torch.norm(pred_quats - gt_quats, dim=-1)[masks].mean()
-                )
+                trans_err = torch.norm(pred_trans - gt_trans, dim=-1)
+                quat_err = torch.norm(pred_quats - gt_quats, dim=-1)
+                pose_loss = trans_err[masks].mean() + quat_err[masks].mean()
 
         return pose_loss
 
@@ -1065,8 +1069,8 @@ class Regr3DPoseBatchList(Regr3DPose):
         details["img_ids"] = (
             np.arange(len(ls_self)).tolist() + np.arange(len(ls_cross)).tolist()
         )
-        pose_img_mask = torch.stack([gt["img_mask"] for gt in gts], dim=0).all(dim=0)
-        pose_masks = pose_masks & pose_img_mask
+        pose_img_mask = torch.stack([gt["img_mask"] for gt in gts], dim=1)
+        pose_masks = pose_masks[:, None] & pose_img_mask
         details["pose_loss"] = self.compute_pose_loss(gt_poses, pr_poses, pose_masks)
 
         return Sum(*list(zip(ls, masks))), (details | monitoring)

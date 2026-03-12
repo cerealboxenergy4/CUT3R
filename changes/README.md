@@ -17,3 +17,4 @@ Chronological list of changes in this repository.
 - 2026-03-12 - Disable training code snapshot copies - changes/2026-03-12_disable-code-snapshot-copy.md
 - 2026-03-12_02:27:19 - Guard empty-mask NaNs - changes/2026-03-12_02:27:19_guard-empty-mask-nan.md
 - 2026-03-12_02:39:04 - Sanitize NaN head postprocess - changes/2026-03-12_02:39:04_sanitize-nan-head-postprocess.md
+- 2026-03-12_04:12:54 - Restore per-view pose supervision - changes/2026-03-12_04:12:54_restore-per-view-pose-supervision.md
