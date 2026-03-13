@@ -15,6 +15,10 @@ def _unwrap_model(model, accelerator):
     return model
 
 
+def _cuda_bf16_autocast(enabled):
+    return torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=enabled)
+
+
 def custom_sort_key(key):
     text = key.split("/")
     if len(text) > 1:
@@ -82,7 +86,7 @@ def loss_of_one_batch(
         batch = to_device(batch, accelerator.device, non_blocking=True)
 
     autocast_enabled = bool(use_amp) and (not inference) and model.training
-    with torch.cuda.amp.autocast(enabled=autocast_enabled):
+    with _cuda_bf16_autocast(enabled=autocast_enabled):
         if inference:
             output, state_args = model(batch, ret_state=True, skip_state=skip_state)
             preds, batch = output.ress, output.views
@@ -96,7 +100,7 @@ def loss_of_one_batch(
             output = model(batch)
             preds, batch = output.ress, output.views
 
-        with torch.cuda.amp.autocast(enabled=False):
+        with _cuda_bf16_autocast(enabled=False):
             loss = criterion(batch, preds) if criterion is not None else None
 
     bayesian = _unwrap_model(model, accelerator).get_bayesian_stats()
@@ -131,7 +135,7 @@ def loss_of_one_batch_tbptt(
     all_loss = 0.0
     all_loss_details = {}
     autocast_enabled = bool(use_amp) and (not inference) and model.training
-    with torch.cuda.amp.autocast(enabled=autocast_enabled):
+    with _cuda_bf16_autocast(enabled=autocast_enabled):
         with torch.no_grad():
             (feat, pos, shape), (
                 init_state_feat,
@@ -175,7 +179,7 @@ def loss_of_one_batch_tbptt(
                         preds.append(res)
                         all_preds.append({k: v.detach() for k, v in res.items()})
                         chunk.append(batch[i])
-                with torch.cuda.amp.autocast(enabled=False):
+                with _cuda_bf16_autocast(enabled=False):
                     loss, loss_details = (
                         criterion(chunk, preds, camera1=batch[0]["camera_pose"])
                         if criterion is not None
@@ -208,7 +212,7 @@ def loss_of_one_batch_tbptt(
                     preds.append(res)
                     all_preds.append({k: v.detach() for k, v in res.items()})
                     chunk.append(batch[i])
-                with torch.cuda.amp.autocast(enabled=False):
+                with _cuda_bf16_autocast(enabled=False):
                     loss, loss_details = (
                         criterion(chunk, preds, camera1=batch[0]["camera_pose"])
                         if criterion is not None

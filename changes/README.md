@@ -24,3 +24,4 @@ Chronological list of changes in this repository.
 - 2026-03-12_04:29:44 - Enable W&B in KITTI PoC config - changes/2026-03-12_04:29:44_enable-wandb-in-kitti-poc-config.md
 - 2026-03-12_06:04:03 - Add multi-GPU init debug logs - changes/2026-03-12_06:04:03_add-multigpu-init-debug-logs.md
 - 2026-03-12_09:37:14 - Refactor bayesian mean alpha formulation - changes/2026-03-12_09:37:14_refactor-bayesian-mean-alpha.md
+- 2026-03-13_10:08:50 - Switch training autocast to bf16 - changes/2026-03-13_10:08:50_switch-training-autocast-to-bf16.md
