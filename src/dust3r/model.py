@@ -827,6 +827,34 @@ class ARCroco3DStereo(CroCoNet):
     def reset_bayesian_cache(self):
         self._bayesian_alpha_history = []
         self._bayesian_kl_history = []
+        self._bayesian_alpha_stats = None
+        self._bayesian_kl_sum = None
+        self._bayesian_kl_count = 0
+
+    def _update_granular_bayesian_stats(self, alpha_tensor, kl_loss=None):
+        alpha_flat = alpha_tensor.detach().reshape(-1)
+        if self._bayesian_alpha_stats is None:
+            self._bayesian_alpha_stats = {
+                "count": alpha_flat.numel(),
+                "sum": alpha_flat.sum(),
+                "sum_sq": alpha_flat.square().sum(),
+                "min": alpha_flat.min(),
+                "max": alpha_flat.max(),
+            }
+        else:
+            stats = self._bayesian_alpha_stats
+            stats["count"] += alpha_flat.numel()
+            stats["sum"] = stats["sum"] + alpha_flat.sum()
+            stats["sum_sq"] = stats["sum_sq"] + alpha_flat.square().sum()
+            stats["min"] = torch.minimum(stats["min"], alpha_flat.min())
+            stats["max"] = torch.maximum(stats["max"], alpha_flat.max())
+        if kl_loss is not None:
+            kl_detached = kl_loss.detach()
+            if self._bayesian_kl_sum is None:
+                self._bayesian_kl_sum = kl_detached
+            else:
+                self._bayesian_kl_sum = self._bayesian_kl_sum + kl_detached
+            self._bayesian_kl_count += 1
 
     def _count_bayesian_decoder_weights(self, layer_idx):
         total = 0
@@ -914,15 +942,10 @@ class ARCroco3DStereo(CroCoNet):
                 latent = posterior_mean
             alpha_tensor = F.softplus(latent) + self.bayesian_alpha_min
             alpha_tensor = torch.clamp(alpha_tensor, max=self.bayesian_alpha_max)
-            decoder_alpha = {
-                "attn": alpha_tensor[:, :, 0, :],
-                "cross_attn": alpha_tensor[:, :, 1, :],
-                "mlp": alpha_tensor[:, :, 2, :],
-            }
             kl_loss = self._compute_granular_explicit_kl(
                 posterior_mean, posterior_logvar
             )
-            return decoder_alpha, kl_loss
+            return alpha_tensor, kl_loss
         pooled_state = self._pool_feature_for_posterior(state_feat)
         alpha = F.softplus(self.dropout_encoder(pooled_state)) + self.bayesian_alpha_min
         return torch.clamp(alpha, max=self.bayesian_alpha_max), None
@@ -933,6 +956,38 @@ class ARCroco3DStereo(CroCoNet):
         return self.bayesian_inference_mode == "stochastic"
 
     def get_bayesian_stats(self):
+        if self.bayesian_mode == "granular":
+            if self._bayesian_alpha_stats is None:
+                device = next(self.parameters()).device
+                zero = torch.zeros((), device=device)
+                return {
+                    "enabled": False,
+                    "kl_loss": zero,
+                    "alpha_mean": zero,
+                    "alpha_var": zero,
+                    "alpha_min": zero,
+                    "alpha_max": zero,
+                }
+            stats = self._bayesian_alpha_stats
+            count = stats["count"]
+            alpha_mean = stats["sum"] / count
+            alpha_var = torch.clamp_min(
+                stats["sum_sq"] / count - alpha_mean.square(), 0.0
+            )
+            if self._bayesian_kl_sum is None or self._bayesian_kl_count == 0:
+                kl_loss = torch.zeros_like(alpha_mean)
+            else:
+                kl_loss = self._bayesian_kl_sum / self._bayesian_kl_count
+            return {
+                "enabled": True,
+                "kl_loss": kl_loss,
+                "alpha_mean": alpha_mean,
+                "alpha_var": alpha_var,
+                "alpha_min": stats["min"],
+                "alpha_max": stats["max"],
+                "omega": self.bayesian_decoder_weight_counts,
+            }
+
         if not self._bayesian_alpha_history:
             device = next(self.parameters()).device
             zero = torch.zeros((), device=device)
@@ -943,24 +998,6 @@ class ARCroco3DStereo(CroCoNet):
                 "alpha_var": zero,
                 "alpha_min": zero,
                 "alpha_max": zero,
-            }
-
-        if self.bayesian_mode == "granular":
-            alpha_hist = torch.stack(self._bayesian_alpha_history, dim=0)
-            flat_alpha = alpha_hist.reshape(-1, alpha_hist.shape[-1])
-            kl_loss = (
-                torch.stack(self._bayesian_kl_history).mean()
-                if self._bayesian_kl_history
-                else torch.zeros((), device=flat_alpha.device, dtype=flat_alpha.dtype)
-            )
-            return {
-                "enabled": True,
-                "kl_loss": kl_loss,
-                "alpha_mean": flat_alpha.mean(),
-                "alpha_var": flat_alpha.var(unbiased=False),
-                "alpha_min": flat_alpha.min(),
-                "alpha_max": flat_alpha.max(),
-                "omega": self.bayesian_decoder_weight_counts,
             }
 
         alpha_hist = torch.stack(self._bayesian_alpha_history, dim=0)
@@ -995,11 +1032,6 @@ class ARCroco3DStereo(CroCoNet):
     def _slice_decoder_alpha(self, decoder_alpha, layer_idx):
         if decoder_alpha is None:
             return None
-        if isinstance(decoder_alpha, dict):
-            return {
-                key: value[:, layer_idx]
-                for key, value in decoder_alpha.items()
-            }
         return decoder_alpha[:, layer_idx]
 
     def _decoder(
@@ -1041,7 +1073,6 @@ class ARCroco3DStereo(CroCoNet):
                 self.gradient_checkpointing
                 and self.training
                 and torch.is_grad_enabled()
-                and not isinstance(layer_alpha, dict)
             )
             if (
                 use_checkpoint
@@ -1140,19 +1171,11 @@ class ARCroco3DStereo(CroCoNet):
             state_feat, current_feat=current_feat, pose_feat=pose_feat
         )
         if decoder_alpha is not None:
-            if isinstance(decoder_alpha, dict):
-                alpha_hist = torch.stack(
-                    [
-                        decoder_alpha["attn"],
-                        decoder_alpha["cross_attn"],
-                        decoder_alpha["mlp"],
-                    ],
-                    dim=2,
-                )
-                self._bayesian_alpha_history.append(alpha_hist)
+            if self.bayesian_mode == "granular":
+                self._update_granular_bayesian_stats(decoder_alpha, bayesian_kl)
             else:
                 self._bayesian_alpha_history.append(decoder_alpha)
-        if bayesian_kl is not None:
+        if bayesian_kl is not None and self.bayesian_mode != "granular":
             self._bayesian_kl_history.append(bayesian_kl)
         new_state_feat, dec = self._decoder(
             state_feat,

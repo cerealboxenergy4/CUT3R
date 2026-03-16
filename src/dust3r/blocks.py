@@ -60,6 +60,10 @@ class DropPath(nn.Module):
 def _select_alpha(alpha, key):
     if isinstance(alpha, dict):
         return alpha.get(key)
+    if torch.is_tensor(alpha) and alpha.ndim >= 2 and alpha.shape[-2] == 3:
+        index = {"attn": 0, "cross_attn": 1, "mlp": 2}.get(key)
+        if index is not None:
+            return alpha.select(dim=-2, index=index)
     return alpha
 
 
