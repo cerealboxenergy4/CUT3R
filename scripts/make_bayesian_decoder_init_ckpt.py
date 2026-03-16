@@ -14,6 +14,8 @@ def build_bayesian_model_string(
     alpha_max,
     kl_weight,
     sample_inference,
+    inference_mode,
+    bayesian_mode,
     hidden_dim,
 ):
     if "use_bayesian_decoder=" in base_model_string:
@@ -26,6 +28,8 @@ def build_bayesian_model_string(
         f", bayesian_alpha_max={alpha_max}"
         f", bayesian_kl_weight={kl_weight}"
         f", bayesian_sample_inference={sample_inference}"
+        f", bayesian_inference_mode='{inference_mode}'"
+        f", bayesian_mode='{bayesian_mode}'"
     )
     if hidden_dim is not None:
         insertion += f", bayesian_hidden_dim={hidden_dim}"
@@ -44,6 +48,18 @@ def main():
     parser.add_argument("--alpha-max", type=float, default=1.0)
     parser.add_argument("--kl-weight", type=float, default=1e-8)
     parser.add_argument("--sample-inference", action="store_true")
+    parser.add_argument(
+        "--inference-mode",
+        choices=("mean", "stochastic"),
+        default=None,
+        help="Inference behavior for Bayesian decoder layers.",
+    )
+    parser.add_argument(
+        "--bayesian-mode",
+        choices=("scalar", "granular"),
+        default="scalar",
+        help="Bayesian decoder mode to initialize in the checkpoint.",
+    )
     parser.add_argument("--hidden-dim", type=int, default=None)
     args = parser.parse_args()
 
@@ -64,6 +80,10 @@ def main():
         alpha_max=args.alpha_max,
         kl_weight=args.kl_weight,
         sample_inference=args.sample_inference,
+        inference_mode=args.inference_mode or (
+            "stochastic" if args.sample_inference else "mean"
+        ),
+        bayesian_mode=args.bayesian_mode,
         hidden_dim=args.hidden_dim,
     )
 

@@ -119,12 +119,16 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         state_dec_num_heads=16,
         use_bayesian_decoder=False,
         bayesian_hidden_dim=None,
+        bayesian_mode="scalar",
         bayesian_alpha_init=0.1,
         bayesian_alpha_min=1e-6,
         bayesian_alpha_max=1.0,
         bayesian_sigma=1e-3,
         bayesian_kl_weight=0.0,
         bayesian_sample_inference=False,
+        bayesian_inference_mode=None,
+        bayesian_posterior_logvar_min=-6.0,
+        bayesian_posterior_logvar_max=2.0,
         depth_head=False,
         rgb_head=False,
         pose_conf_head=False,
@@ -147,12 +151,20 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         self.local_mem_size = local_mem_size
         self.use_bayesian_decoder = use_bayesian_decoder
         self.bayesian_hidden_dim = bayesian_hidden_dim
+        self.bayesian_mode = bayesian_mode
         self.bayesian_alpha_init = bayesian_alpha_init
         self.bayesian_alpha_min = bayesian_alpha_min
         self.bayesian_alpha_max = bayesian_alpha_max
         self.bayesian_sigma = bayesian_sigma
         self.bayesian_kl_weight = bayesian_kl_weight
         self.bayesian_sample_inference = bayesian_sample_inference
+        if bayesian_inference_mode is None:
+            bayesian_inference_mode = (
+                "stochastic" if bayesian_sample_inference else "mean"
+            )
+        self.bayesian_inference_mode = bayesian_inference_mode
+        self.bayesian_posterior_logvar_min = bayesian_posterior_logvar_min
+        self.bayesian_posterior_logvar_max = bayesian_posterior_logvar_max
         self.depth_head = depth_head
         self.rgb_head = rgb_head
         self.pose_conf_head = pose_conf_head
@@ -277,11 +289,15 @@ class ARCroco3DStereo(CroCoNet):
         self.enc_norm_ray_map = nn.LayerNorm(self.enc_embed_dim, eps=1e-6)
         self.dec_num_heads = self.croco_args["dec_num_heads"]
         self.use_bayesian_decoder = config.use_bayesian_decoder
+        self.bayesian_mode = config.bayesian_mode
         self.bayesian_alpha_init = config.bayesian_alpha_init
         self.bayesian_alpha_min = config.bayesian_alpha_min
         self.bayesian_alpha_max = config.bayesian_alpha_max
         self.bayesian_sigma = config.bayesian_sigma
         self.bayesian_sample_inference = config.bayesian_sample_inference
+        self.bayesian_inference_mode = config.bayesian_inference_mode
+        self.bayesian_posterior_logvar_min = config.bayesian_posterior_logvar_min
+        self.bayesian_posterior_logvar_max = config.bayesian_posterior_logvar_max
         self.pose_head_flag = config.pose_head
         if self.pose_head_flag:
             self.pose_token = nn.Parameter(
@@ -318,16 +334,39 @@ class ARCroco3DStereo(CroCoNet):
         )
         if self.use_bayesian_decoder:
             hidden_dim = config.bayesian_hidden_dim or self.dec_embed_dim
-            self.dropout_encoder = nn.Sequential(
-                nn.LayerNorm(self.dec_embed_dim),
-                nn.Linear(self.dec_embed_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, self.dec_depth),
-            )
+            if self.bayesian_mode == "granular":
+                posterior_input_dim = self.dec_embed_dim * 4
+                posterior_output_dim = self.dec_depth * 3 * self.dec_embed_dim
+                self.dropout_encoder = nn.Sequential(
+                    nn.LayerNorm(posterior_input_dim),
+                    nn.Linear(posterior_input_dim, hidden_dim),
+                    nn.GELU(),
+                )
+                self.dropout_encoder_mean = nn.Linear(
+                    hidden_dim, posterior_output_dim
+                )
+                self.dropout_encoder_logvar = nn.Linear(
+                    hidden_dim, posterior_output_dim
+                )
+            else:
+                self.dropout_encoder = nn.Sequential(
+                    nn.LayerNorm(self.dec_embed_dim),
+                    nn.Linear(self.dec_embed_dim, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, self.dec_depth),
+                )
+                self.dropout_encoder_mean = None
+                self.dropout_encoder_logvar = None
             self.reset_bayesian_dropout_encoder()
-            bayesian_param_counts = [
-                self._count_bayesian_decoder_weights(i) for i in range(self.dec_depth)
-            ]
+            if self.bayesian_mode == "granular":
+                bayesian_param_counts = [
+                    self._count_bayesian_decoder_submodule_weights(i)
+                    for i in range(self.dec_depth)
+                ]
+            else:
+                bayesian_param_counts = [
+                    self._count_bayesian_decoder_weights(i) for i in range(self.dec_depth)
+                ]
             self.register_buffer(
                 "bayesian_decoder_weight_counts",
                 torch.tensor(bayesian_param_counts, dtype=torch.float32),
@@ -335,6 +374,8 @@ class ARCroco3DStereo(CroCoNet):
             )
         else:
             self.dropout_encoder = None
+            self.dropout_encoder_mean = None
+            self.dropout_encoder_logvar = None
             self.register_buffer(
                 "bayesian_decoder_weight_counts",
                 torch.zeros(0, dtype=torch.float32),
@@ -485,6 +526,11 @@ class ARCroco3DStereo(CroCoNet):
                 )
             for param in self.dropout_encoder.parameters():
                 param.requires_grad = True
+            for module in (self.dropout_encoder_mean, self.dropout_encoder_logvar):
+                if module is None:
+                    continue
+                for param in module.parameters():
+                    param.requires_grad = True
             return
         to_be_frozen = {
             "none": [],
@@ -527,6 +573,8 @@ class ARCroco3DStereo(CroCoNet):
                 self.decoder_embed_state,
                 self.decoder_embed,
                 *([self.dropout_encoder] if self.dropout_encoder is not None else []),
+                *([self.dropout_encoder_mean] if self.dropout_encoder_mean is not None else []),
+                *([self.dropout_encoder_logvar] if self.dropout_encoder_logvar is not None else []),
                 self.dec_norm,
                 self.dec_norm_state,
             ],
@@ -536,6 +584,8 @@ class ARCroco3DStereo(CroCoNet):
                 self.pose_retriever,
                 self.pose_token,
                 *([self.dropout_encoder] if self.dropout_encoder is not None else []),
+                *([self.dropout_encoder_mean] if self.dropout_encoder_mean is not None else []),
+                *([self.dropout_encoder_logvar] if self.dropout_encoder_logvar is not None else []),
             ],
         }
         if freeze not in to_be_frozen:
@@ -752,16 +802,29 @@ class ARCroco3DStereo(CroCoNet):
         if not self.use_bayesian_decoder or self.dropout_encoder is None:
             return
         target = self._validate_bayesian_alpha_config()
-        self.dropout_encoder[0].reset_parameters()
-        self.dropout_encoder[1].reset_parameters()
-        self.dropout_encoder[3].reset_parameters()
-        nn.init.zeros_(self.dropout_encoder[3].weight)
-        init_bias = torch.log(torch.expm1(torch.tensor(target)))
-        nn.init.constant_(self.dropout_encoder[3].bias, float(init_bias))
+        for module in self.dropout_encoder:
+            if hasattr(module, "reset_parameters"):
+                module.reset_parameters()
+        if self.bayesian_mode == "granular":
+            assert self.dropout_encoder_mean is not None
+            assert self.dropout_encoder_logvar is not None
+            self.dropout_encoder_mean.reset_parameters()
+            self.dropout_encoder_logvar.reset_parameters()
+            nn.init.zeros_(self.dropout_encoder_mean.weight)
+            init_bias = torch.log(torch.expm1(torch.tensor(target)))
+            nn.init.constant_(self.dropout_encoder_mean.bias, float(init_bias))
+            nn.init.zeros_(self.dropout_encoder_logvar.weight)
+            nn.init.constant_(self.dropout_encoder_logvar.bias, -4.0)
+        else:
+            self.dropout_encoder[3].reset_parameters()
+            nn.init.zeros_(self.dropout_encoder[3].weight)
+            init_bias = torch.log(torch.expm1(torch.tensor(target)))
+            nn.init.constant_(self.dropout_encoder[3].bias, float(init_bias))
         self._set_bayesian_sigma()
 
     def reset_bayesian_cache(self):
         self._bayesian_alpha_history = []
+        self._bayesian_kl_history = []
 
     def _count_bayesian_decoder_weights(self, layer_idx):
         total = 0
@@ -772,20 +835,101 @@ class ARCroco3DStereo(CroCoNet):
                     total += module.weight.numel()
         return total
 
-    def _pool_state_for_dropout_encoder(self, state_feat):
-        return state_feat.mean(dim=1)
+    def _count_bayesian_decoder_submodule_weights(self, layer_idx):
+        counts = []
+        for attr_name in ("attn", "cross_attn", "mlp"):
+            total = 0
+            for block in (self.dec_blocks_state[layer_idx], self.dec_blocks[layer_idx]):
+                for module in getattr(block, attr_name).modules():
+                    if isinstance(module, BayesianLinear):
+                        total += module.weight.numel()
+            counts.append(total)
+        return counts
 
-    def _compute_decoder_alpha(self, state_feat):
-        if not self.use_bayesian_decoder:
+    def _pool_feature_for_posterior(self, feat):
+        if feat is None:
             return None
-        pooled_state = self._pool_state_for_dropout_encoder(state_feat)
+        return feat.mean(dim=1)
+
+    def _compose_granular_posterior_input(self, state_feat, current_feat, pose_feat):
+        pooled_state = self._pool_feature_for_posterior(state_feat)
+        pooled_current = self._pool_feature_for_posterior(current_feat)
+        pooled_pose = self._pool_feature_for_posterior(pose_feat)
+        if pooled_pose is None:
+            pooled_pose = torch.zeros_like(pooled_state)
+        delta = pooled_current - pooled_state
+        return torch.cat([pooled_state, pooled_current, pooled_pose, delta], dim=-1)
+
+    def _compute_granular_explicit_kl(self, posterior_mean, posterior_logvar):
+        prior_mean = torch.log(
+            torch.expm1(
+                torch.tensor(
+                    self.bayesian_alpha_init - self.bayesian_alpha_min,
+                    device=posterior_mean.device,
+                    dtype=posterior_mean.dtype,
+                )
+            )
+        )
+        prior_logvar = torch.zeros_like(posterior_logvar)
+        posterior_var = posterior_logvar.exp()
+        prior_var = prior_logvar.exp()
+        kl = 0.5 * (
+            prior_logvar
+            - posterior_logvar
+            + (posterior_var + (posterior_mean - prior_mean).square()) / prior_var
+            - 1.0
+        )
+        weight_counts = self.bayesian_decoder_weight_counts.to(
+            device=posterior_mean.device, dtype=posterior_mean.dtype
+        )
+        per_channel_weight = weight_counts.unsqueeze(0).unsqueeze(-1) / posterior_mean.shape[-1]
+        return (per_channel_weight * kl).sum(dim=(-1, -2, -3)).mean()
+
+    def _compute_decoder_alpha(self, state_feat, current_feat=None, pose_feat=None):
+        if not self.use_bayesian_decoder:
+            return None, None
+        if self.bayesian_mode == "granular":
+            posterior_input = self._compose_granular_posterior_input(
+                state_feat, current_feat, pose_feat
+            )
+            hidden = self.dropout_encoder(posterior_input)
+            assert self.dropout_encoder_mean is not None
+            assert self.dropout_encoder_logvar is not None
+            posterior_mean = self.dropout_encoder_mean(hidden).view(
+                state_feat.shape[0], self.dec_depth, 3, self.dec_embed_dim
+            )
+            posterior_logvar = self.dropout_encoder_logvar(hidden).view(
+                state_feat.shape[0], self.dec_depth, 3, self.dec_embed_dim
+            )
+            posterior_logvar = posterior_logvar.clamp(
+                min=self.bayesian_posterior_logvar_min,
+                max=self.bayesian_posterior_logvar_max,
+            )
+            if self._should_sample_bayesian():
+                latent = posterior_mean + torch.randn_like(posterior_mean) * torch.exp(
+                    0.5 * posterior_logvar
+                )
+            else:
+                latent = posterior_mean
+            alpha_tensor = F.softplus(latent) + self.bayesian_alpha_min
+            alpha_tensor = torch.clamp(alpha_tensor, max=self.bayesian_alpha_max)
+            decoder_alpha = {
+                "attn": alpha_tensor[:, :, 0, :],
+                "cross_attn": alpha_tensor[:, :, 1, :],
+                "mlp": alpha_tensor[:, :, 2, :],
+            }
+            kl_loss = self._compute_granular_explicit_kl(
+                posterior_mean, posterior_logvar
+            )
+            return decoder_alpha, kl_loss
+        pooled_state = self._pool_feature_for_posterior(state_feat)
         alpha = F.softplus(self.dropout_encoder(pooled_state)) + self.bayesian_alpha_min
-        return torch.clamp(alpha, max=self.bayesian_alpha_max)
+        return torch.clamp(alpha, max=self.bayesian_alpha_max), None
 
     def _should_sample_bayesian(self):
         if self.training:
             return True
-        return self.bayesian_sample_inference
+        return self.bayesian_inference_mode == "stochastic"
 
     def get_bayesian_stats(self):
         if not self._bayesian_alpha_history:
@@ -798,6 +942,24 @@ class ARCroco3DStereo(CroCoNet):
                 "alpha_var": zero,
                 "alpha_min": zero,
                 "alpha_max": zero,
+            }
+
+        if self.bayesian_mode == "granular":
+            alpha_hist = torch.stack(self._bayesian_alpha_history, dim=0)
+            flat_alpha = alpha_hist.reshape(-1, alpha_hist.shape[-1])
+            kl_loss = (
+                torch.stack(self._bayesian_kl_history).mean()
+                if self._bayesian_kl_history
+                else torch.zeros((), device=flat_alpha.device, dtype=flat_alpha.dtype)
+            )
+            return {
+                "enabled": True,
+                "kl_loss": kl_loss,
+                "alpha_mean": flat_alpha.mean(),
+                "alpha_var": flat_alpha.var(unbiased=False),
+                "alpha_min": flat_alpha.min(),
+                "alpha_max": flat_alpha.max(),
+                "omega": self.bayesian_decoder_weight_counts,
             }
 
         alpha_hist = torch.stack(self._bayesian_alpha_history, dim=0)
@@ -828,6 +990,16 @@ class ARCroco3DStereo(CroCoNet):
             "alpha_gamma": gamma,
             "omega": self.bayesian_decoder_weight_counts,
         }
+
+    def _slice_decoder_alpha(self, decoder_alpha, layer_idx):
+        if decoder_alpha is None:
+            return None
+        if isinstance(decoder_alpha, dict):
+            return {
+                key: value[:, layer_idx]
+                for key, value in decoder_alpha.items()
+            }
+        return decoder_alpha[:, layer_idx]
 
     def _decoder(
         self,
@@ -863,11 +1035,15 @@ class ARCroco3DStereo(CroCoNet):
         for layer_idx, (blk_state, blk_img) in enumerate(
             zip(self.dec_blocks_state, self.dec_blocks)
         ):  # decoder block depth만큼 반복
-            layer_alpha = None if decoder_alpha is None else decoder_alpha[:, layer_idx]
-            if (
+            layer_alpha = self._slice_decoder_alpha(decoder_alpha, layer_idx)
+            use_checkpoint = (
                 self.gradient_checkpointing
                 and self.training
                 and torch.is_grad_enabled()
+                and not isinstance(layer_alpha, dict)
+            )
+            if (
+                use_checkpoint
             ):
                 f_state, _ = checkpoint(
                     blk_state,
@@ -959,9 +1135,24 @@ class ARCroco3DStereo(CroCoNet):
         reset_mask=None,
         update=None,
     ):
-        decoder_alpha = self._compute_decoder_alpha(state_feat)
+        decoder_alpha, bayesian_kl = self._compute_decoder_alpha(
+            state_feat, current_feat=current_feat, pose_feat=pose_feat
+        )
         if decoder_alpha is not None:
-            self._bayesian_alpha_history.append(decoder_alpha)
+            if isinstance(decoder_alpha, dict):
+                alpha_hist = torch.stack(
+                    [
+                        decoder_alpha["attn"],
+                        decoder_alpha["cross_attn"],
+                        decoder_alpha["mlp"],
+                    ],
+                    dim=2,
+                )
+                self._bayesian_alpha_history.append(alpha_hist)
+            else:
+                self._bayesian_alpha_history.append(decoder_alpha)
+        if bayesian_kl is not None:
+            self._bayesian_kl_history.append(bayesian_kl)
         new_state_feat, dec = self._decoder(
             state_feat,
             state_pos,

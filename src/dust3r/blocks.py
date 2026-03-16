@@ -57,10 +57,31 @@ class DropPath(nn.Module):
         return f"drop_prob={round(self.drop_prob,3):0.3f}"
 
 
+def _select_alpha(alpha, key):
+    if isinstance(alpha, dict):
+        return alpha.get(key)
+    return alpha
+
+
 class BayesianLinear(nn.Linear):
     def __init__(self, *args, sigma=1e-3, **kwargs):
         super().__init__(*args, **kwargs)
         self.sigma = float(sigma)
+
+    def _match_alpha_shape(self, alpha, weight_mean):
+        alpha = torch.as_tensor(alpha, dtype=weight_mean.dtype, device=weight_mean.device)
+        alpha = torch.clamp_min(alpha, 0.0)
+        if alpha.shape[-1] != weight_mean.shape[-1]:
+            if weight_mean.shape[-1] % alpha.shape[-1] != 0:
+                raise ValueError(
+                    f"Cannot broadcast alpha with last dim {alpha.shape[-1]} "
+                    f"to output dim {weight_mean.shape[-1]}"
+                )
+            repeat_factor = weight_mean.shape[-1] // alpha.shape[-1]
+            alpha = alpha.repeat_interleave(repeat_factor, dim=-1)
+        while alpha.ndim < weight_mean.ndim:
+            alpha = alpha.unsqueeze(1)
+        return alpha
 
     def forward(self, input, alpha=None, sample=None):
         weight_mean = F.linear(input, self.weight, None)
@@ -68,10 +89,7 @@ class BayesianLinear(nn.Linear):
             return weight_mean if self.bias is None else weight_mean + self.bias
 
         sample = self.training if sample is None else sample
-        alpha = torch.as_tensor(alpha, dtype=weight_mean.dtype, device=weight_mean.device)
-        alpha = torch.clamp_min(alpha, 0.0)
-        while alpha.ndim < weight_mean.ndim:
-            alpha = alpha.unsqueeze(-1)
+        alpha = self._match_alpha_shape(alpha, weight_mean)
 
         mean = weight_mean * alpha
         if self.bias is not None:
@@ -217,8 +235,12 @@ class Block(nn.Module):
         )
 
     def forward(self, x, xpos, alpha=None, sample=None):
-        x = x + self.drop_path(self.attn(self.norm1(x), xpos, alpha=alpha, sample=sample))
-        x = x + self.drop_path(self.mlp(self.norm2(x), alpha=alpha, sample=sample))
+        attn_alpha = _select_alpha(alpha, "attn")
+        mlp_alpha = _select_alpha(alpha, "mlp")
+        x = x + self.drop_path(
+            self.attn(self.norm1(x), xpos, alpha=attn_alpha, sample=sample)
+        )
+        x = x + self.drop_path(self.mlp(self.norm2(x), alpha=mlp_alpha, sample=sample))
         return x
 
 
@@ -352,16 +374,19 @@ class DecoderBlock(nn.Module):
         self.norm_y = norm_layer(dim) if norm_mem else nn.Identity()
 
     def forward(self, x, y, xpos, ypos, alpha=None, sample=None):
+        attn_alpha = _select_alpha(alpha, "attn")
+        cross_alpha = _select_alpha(alpha, "cross_attn")
+        mlp_alpha = _select_alpha(alpha, "mlp")
         x = x + self.drop_path(
-            self.attn(self.norm1(x), xpos, alpha=alpha, sample=sample)
+            self.attn(self.norm1(x), xpos, alpha=attn_alpha, sample=sample)
         )
         y_ = self.norm_y(y)
         x = x + self.drop_path(
             self.cross_attn(
-                self.norm2(x), y_, y_, xpos, ypos, alpha=alpha, sample=sample
+                self.norm2(x), y_, y_, xpos, ypos, alpha=cross_alpha, sample=sample
             )
         )
-        x = x + self.drop_path(self.mlp(self.norm3(x), alpha=alpha, sample=sample))
+        x = x + self.drop_path(self.mlp(self.norm3(x), alpha=mlp_alpha, sample=sample))
         return x, y
 
     
@@ -413,17 +438,20 @@ class CustomDecoderBlock(nn.Module):
         self.norm_z = norm_layer(dim) if norm_mem else nn.Identity()
 
     def forward(self, x, y, z, xpos, ypos, alpha=None, sample=None):
+        attn_alpha = _select_alpha(alpha, "attn")
+        cross_alpha = _select_alpha(alpha, "cross_attn")
+        mlp_alpha = _select_alpha(alpha, "mlp")
         x = x + self.drop_path(
-            self.attn(self.norm1(x), xpos, alpha=alpha, sample=sample)
+            self.attn(self.norm1(x), xpos, alpha=attn_alpha, sample=sample)
         )
         y_ = self.norm_y(y)
         z_ = self.norm_z(z)
         x = x + self.drop_path(
             self.cross_attn(
-                self.norm2(x), y_, z_, xpos, ypos, alpha=alpha, sample=sample
+                self.norm2(x), y_, z_, xpos, ypos, alpha=cross_alpha, sample=sample
             )
         )
-        x = x + self.drop_path(self.mlp(self.norm3(x), alpha=alpha, sample=sample))
+        x = x + self.drop_path(self.mlp(self.norm3(x), alpha=mlp_alpha, sample=sample))
         return x, y
 
 
@@ -489,10 +517,12 @@ class ConditionModulationBlock(nn.Module):
         )
 
     def forward(self, x, mod, xpos, alpha=None, sample=None):
+        attn_alpha = _select_alpha(alpha, "attn")
+        mlp_alpha = _select_alpha(alpha, "mlp")
         x = x + self.drop_path(
-            self.attn(self.norm1(x, mod), xpos, alpha=alpha, sample=sample)
+            self.attn(self.norm1(x, mod), xpos, alpha=attn_alpha, sample=sample)
         )
-        x = x + self.drop_path(self.mlp(self.norm2(x, mod), alpha=alpha, sample=sample))
+        x = x + self.drop_path(self.mlp(self.norm2(x, mod), alpha=mlp_alpha, sample=sample))
         return x
 
 
