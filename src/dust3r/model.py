@@ -335,7 +335,9 @@ class ARCroco3DStereo(CroCoNet):
         if self.use_bayesian_decoder:
             hidden_dim = config.bayesian_hidden_dim or self.dec_embed_dim
             if self.bayesian_mode == "granular":
-                posterior_input_dim = self.dec_embed_dim * 4
+                posterior_input_dim = (
+                    self.dec_embed_dim + self.enc_embed_dim + self.dec_embed_dim
+                )
                 posterior_output_dim = self.dec_depth * 3 * self.dec_embed_dim
                 self.dropout_encoder = nn.Sequential(
                     nn.LayerNorm(posterior_input_dim),
@@ -857,8 +859,7 @@ class ARCroco3DStereo(CroCoNet):
         pooled_pose = self._pool_feature_for_posterior(pose_feat)
         if pooled_pose is None:
             pooled_pose = torch.zeros_like(pooled_state)
-        delta = pooled_current - pooled_state
-        return torch.cat([pooled_state, pooled_current, pooled_pose, delta], dim=-1)
+        return torch.cat([pooled_state, pooled_current, pooled_pose], dim=-1)
 
     def _compute_granular_explicit_kl(self, posterior_mean, posterior_logvar):
         prior_mean = torch.log(
