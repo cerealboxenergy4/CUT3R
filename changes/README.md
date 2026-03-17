@@ -28,3 +28,4 @@ Chronological list of changes in this repository.
 - 2026-03-16_13:53:09 - Add granular bayesian mode - changes/2026-03-16_13:53:09_add-granular-bayesian-mode.md
 - 2026-03-16_14:11:20 - Switch granular posterior to concat-only - changes/2026-03-16_14:11:20_switch-granular-posterior-to-concat-only.md
 - 2026-03-16_14:21:25 - Reduce granular VRAM usage - changes/2026-03-16_14:21:25_reduce-granular-vram.md
+- 2026-03-17_10:47:20 - Add granular LoRA training - changes/2026-03-17_10:47:20_add-granular-lora-training.md

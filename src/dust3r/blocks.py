@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from itertools import repeat
 import collections.abc
+import math
 from torch.nn.functional import scaled_dot_product_attention
 from functools import partial
 
@@ -71,6 +72,53 @@ class BayesianLinear(nn.Linear):
     def __init__(self, *args, sigma=1e-3, **kwargs):
         super().__init__(*args, **kwargs)
         self.sigma = float(sigma)
+        self.lora_rank = 0
+        self.lora_alpha = 0.0
+        self.lora_scaling = 0.0
+        self.lora_A = None
+        self.lora_B = None
+        self.lora_dropout = nn.Identity()
+
+    def enable_lora(self, rank, alpha, dropout=0.0):
+        rank = int(rank)
+        if rank <= 0:
+            return
+        if self.lora_A is not None and self.lora_B is not None:
+            return
+        self.lora_rank = rank
+        self.lora_alpha = float(alpha)
+        self.lora_scaling = self.lora_alpha / self.lora_rank
+        self.lora_A = nn.Parameter(
+            torch.empty(rank, self.in_features, device=self.weight.device, dtype=self.weight.dtype)
+        )
+        self.lora_B = nn.Parameter(
+            torch.zeros(self.out_features, rank, device=self.weight.device, dtype=self.weight.dtype)
+        )
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+        self.lora_dropout = nn.Dropout(float(dropout)) if dropout > 0 else nn.Identity()
+
+    def has_lora(self):
+        return self.lora_A is not None and self.lora_B is not None
+
+    def lora_parameters(self):
+        params = []
+        if self.lora_A is not None:
+            params.append(self.lora_A)
+        if self.lora_B is not None:
+            params.append(self.lora_B)
+        return params
+
+    def _lora_delta_weight(self):
+        if not self.has_lora():
+            return None
+        return (self.lora_B @ self.lora_A) * self.lora_scaling
+
+    def _effective_weight(self):
+        delta = self._lora_delta_weight()
+        if delta is None:
+            return self.weight
+        return self.weight + delta.to(dtype=self.weight.dtype, device=self.weight.device)
 
     def _match_alpha_shape(self, alpha, weight_mean):
         alpha = torch.as_tensor(alpha, dtype=weight_mean.dtype, device=weight_mean.device)
@@ -88,7 +136,14 @@ class BayesianLinear(nn.Linear):
         return alpha
 
     def forward(self, input, alpha=None, sample=None):
-        weight_mean = F.linear(input, self.weight, None)
+        weight = self._effective_weight()
+        lora_input = self.lora_dropout(input) if self.has_lora() else input
+        if self.has_lora():
+            weight_mean = F.linear(input, self.weight, None) + F.linear(
+                lora_input, self._lora_delta_weight().to(dtype=input.dtype, device=input.device), None
+            )
+        else:
+            weight_mean = F.linear(input, weight, None)
         if alpha is None:
             return weight_mean if self.bias is None else weight_mean + self.bias
 
@@ -102,7 +157,7 @@ class BayesianLinear(nn.Linear):
         if not sample:
             return mean
 
-        variance = F.linear(input.square(), self.weight.square(), None)
+        variance = F.linear(input.square(), weight.square(), None)
         variance = variance * alpha.square() * (self.sigma ** 2)
         noise = torch.randn_like(mean)
         return mean + noise * torch.sqrt(torch.clamp_min(variance, 1e-8))

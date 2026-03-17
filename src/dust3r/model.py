@@ -120,6 +120,12 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         use_bayesian_decoder=False,
         bayesian_hidden_dim=None,
         bayesian_mode="scalar",
+        use_lora=False,
+        lora_rank=0,
+        lora_alpha=1.0,
+        lora_dropout=0.0,
+        lora_on_decoder=True,
+        lora_on_state_decoder=True,
         bayesian_alpha_init=0.1,
         bayesian_alpha_min=1e-6,
         bayesian_alpha_max=1.0,
@@ -152,6 +158,12 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         self.use_bayesian_decoder = use_bayesian_decoder
         self.bayesian_hidden_dim = bayesian_hidden_dim
         self.bayesian_mode = bayesian_mode
+        self.use_lora = use_lora
+        self.lora_rank = int(lora_rank)
+        self.lora_alpha = float(lora_alpha)
+        self.lora_dropout = float(lora_dropout)
+        self.lora_on_decoder = bool(lora_on_decoder)
+        self.lora_on_state_decoder = bool(lora_on_state_decoder)
         self.bayesian_alpha_init = bayesian_alpha_init
         self.bayesian_alpha_min = bayesian_alpha_min
         self.bayesian_alpha_max = bayesian_alpha_max
@@ -290,6 +302,12 @@ class ARCroco3DStereo(CroCoNet):
         self.dec_num_heads = self.croco_args["dec_num_heads"]
         self.use_bayesian_decoder = config.use_bayesian_decoder
         self.bayesian_mode = config.bayesian_mode
+        self.use_lora = config.use_lora
+        self.lora_rank = config.lora_rank
+        self.lora_alpha = config.lora_alpha
+        self.lora_dropout = config.lora_dropout
+        self.lora_on_decoder = config.lora_on_decoder
+        self.lora_on_state_decoder = config.lora_on_state_decoder
         self.bayesian_alpha_init = config.bayesian_alpha_init
         self.bayesian_alpha_min = config.bayesian_alpha_min
         self.bayesian_alpha_max = config.bayesian_alpha_max
@@ -396,6 +414,7 @@ class ARCroco3DStereo(CroCoNet):
             config.pose_head,
             **self.croco_args,
         )
+        self._configure_lora()
         self.set_freeze(config.freeze)
 
         # added for attention map visualization
@@ -515,8 +534,33 @@ class ARCroco3DStereo(CroCoNet):
                                 f"Skipping '{key}': size mismatch (ckpt: {new_ckpt[key].size()}, model: {self.state_dict()[key].size()})"
                             )
                     else:
-                        printer.info(f"Skipping '{key}': not found in model")
+                            printer.info(f"Skipping '{key}': not found in model")
                 return super().load_state_dict(new_new_ckpt, **kw)
+
+    def _enable_lora_for_module(self, module):
+        for submodule in module.modules():
+            if isinstance(submodule, BayesianLinear):
+                submodule.enable_lora(
+                    rank=self.lora_rank,
+                    alpha=self.lora_alpha,
+                    dropout=self.lora_dropout,
+                )
+
+    def _configure_lora(self):
+        if not self.use_lora or self.lora_rank <= 0:
+            return
+        if self.lora_on_decoder:
+            self._enable_lora_for_module(self.dec_blocks)
+        if self.lora_on_state_decoder:
+            self._enable_lora_for_module(self.dec_blocks_state)
+
+    def _enable_lora_gradients(self):
+        if not self.use_lora:
+            return
+        for module in self.modules():
+            if isinstance(module, BayesianLinear):
+                for param in module.lora_parameters():
+                    param.requires_grad = True
 
     def set_freeze(self, freeze):  # this is for use by downstream models
         self.freeze = freeze
@@ -533,6 +577,21 @@ class ARCroco3DStereo(CroCoNet):
                     continue
                 for param in module.parameters():
                     param.requires_grad = True
+            return
+        if freeze == "dropout_encoder_lora_only":
+            freeze_all_params([self])
+            if self.dropout_encoder is None:
+                raise ValueError(
+                    "freeze='dropout_encoder_lora_only' requires use_bayesian_decoder=True"
+                )
+            for param in self.dropout_encoder.parameters():
+                param.requires_grad = True
+            for module in (self.dropout_encoder_mean, self.dropout_encoder_logvar):
+                if module is None:
+                    continue
+                for param in module.parameters():
+                    param.requires_grad = True
+            self._enable_lora_gradients()
             return
         to_be_frozen = {
             "none": [],
