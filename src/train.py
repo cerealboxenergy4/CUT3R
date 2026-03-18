@@ -12,6 +12,7 @@ import os
 import sys
 import time
 import math
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Sized
@@ -113,6 +114,27 @@ class TrainLogger:
             self.tensorboard_writer.close()
         if self.wandb_run is not None:
             self.wandb_run.finish()
+
+
+def sanitize_metric_component(value: str) -> str:
+    value = value.strip()
+    value = re.sub(r"^\s*\d+\s*@\s*", "", value)
+    value = re.sub(r"[^0-9a-zA-Z]+", "_", value)
+    value = value.strip("_").lower()
+    return value or "metric"
+
+
+def build_test_metric_name(dataset_expr: str, seen_names: dict[str, int]) -> str:
+    dataset_name = dataset_expr.split("(", 1)[0]
+    base_name = sanitize_metric_component(dataset_name)
+    seen_names[base_name] += 1
+    if seen_names[base_name] > 1:
+        return f"{base_name}_{seen_names[base_name]}"
+    return base_name
+
+
+def join_metric_path(*parts: str) -> str:
+    return "/".join(part.strip("/") for part in parts if part)
 
 
 def build_logger(args, accelerator):
@@ -258,8 +280,11 @@ def train(args):
         fixed_length=args.fixed_length
     )
     printer.info("Building test dataset %s", args.test_dataset)
-    data_loader_test = {
-        dataset.split("(")[0]: build_dataset(
+    data_loader_test = {}
+    seen_test_names = defaultdict(int)
+    for dataset in args.test_dataset.split("+"):
+        test_name = build_test_metric_name(dataset, seen_test_names)
+        data_loader_test[test_name] = build_dataset(
             dataset,
             args.batch_size,
             args.num_workers,
@@ -267,8 +292,6 @@ def train(args):
             test=True,
             fixed_length=True
         )
-        for dataset in args.test_dataset.split("+")
-    }
 
     # model
     printer.info("Loading model: %s", args.model)
@@ -356,7 +379,8 @@ def train(args):
             ) as f:
                 f.write(json.dumps(log_stats) + "\n")
             if logger is not None:
-                logger.log_metrics(log_stats, step=epoch)
+                # Keep W&B/TensorBoard on the same monotonic train-step axis.
+                logger.add_scalar("meta/epoch", epoch, epoch * len(data_loader_train))
 
     def save_model(epoch, fname, best_so_far):
         misc.save_model(
@@ -380,6 +404,7 @@ def train(args):
     printer.info("[RANK %s] Building experiment logger", accelerator.process_index)
     logger = build_logger(args, accelerator)
     printer.info("[RANK %s] Logger ready", accelerator.process_index)
+    state_recur_cache = {}
 
     printer.info(f"Start training for {args.epochs} epochs")
     start_time = time.time()
@@ -411,6 +436,7 @@ def train(args):
                     log_writer=logger,
                     args=args,
                     prefix=test_name,
+                    global_step=epoch * len(data_loader_train),
                 )
                 test_stats[test_name] = stats
 
@@ -440,6 +466,7 @@ def train(args):
             loss_scaler,
             log_writer=logger,
             args=args,
+            state_recur_cache=state_recur_cache,
         )
 
     total_time = time.time() - start_time
@@ -485,6 +512,70 @@ def build_dataset(dataset, batch_size, num_workers, accelerator, test=False, fix
     return loader
 
 
+def get_batch_sequence_keys(batch):
+    if not batch:
+        return []
+    ref_view = batch[0]
+    labels = ref_view.get("label")
+    datasets = ref_view.get("dataset")
+    instances = ref_view.get("instance")
+
+    if isinstance(labels, (list, tuple)):
+        batch_size = len(labels)
+    elif isinstance(datasets, (list, tuple)):
+        batch_size = len(datasets)
+    elif isinstance(instances, (list, tuple)):
+        batch_size = len(instances)
+    else:
+        batch_size = 1
+
+    def _select(value, index):
+        if isinstance(value, (list, tuple)):
+            return value[index]
+        return value
+
+    keys = []
+    for index in range(batch_size):
+        dataset = _select(datasets, index) if datasets is not None else "unknown"
+        label = _select(labels, index) if labels is not None else _select(instances, index)
+        keys.append(f"{dataset}::{label}")
+    return keys
+
+
+def build_state_recur_override(batch, state_cache, prob):
+    keys = get_batch_sequence_keys(batch)
+    if not state_cache or prob <= 0.0 or not keys:
+        return None, None, keys
+
+    template = next((state_cache[key] for key in keys if key in state_cache), None)
+    if template is None:
+        return None, None, keys
+
+    zero_state = torch.zeros_like(template)
+    override_states = []
+    override_mask = []
+    for key in keys:
+        use_cached = key in state_cache and random.random() < prob
+        override_mask.append(use_cached)
+        override_states.append(state_cache[key] if use_cached else zero_state)
+
+    if not any(override_mask):
+        return None, None, keys
+
+    return (
+        torch.stack(override_states, dim=0),
+        torch.tensor(override_mask, dtype=torch.bool),
+        keys,
+    )
+
+
+def update_state_recur_cache(state_cache, keys, state_cache_output):
+    if state_cache_output is None or not keys:
+        return
+    for index, key in enumerate(keys):
+        state_cache[key] = state_cache_output[index].clone()
+
+
 def apply_bayesian_regularizer(loss, loss_details, bayesian_stats, kl_weight):
     if loss_details is None:
         loss_details = {}
@@ -523,6 +614,7 @@ def train_one_epoch(
     loss_scaler,
     args,
     log_writer=None,
+    state_recur_cache=None,
 ):
     assert torch.backends.cuda.matmul.allow_tf32 == True
 
@@ -557,10 +649,19 @@ def train_one_epoch(
         data_loader.batch_sampler.batch_sampler.set_epoch(epoch)
 
     optimizer.zero_grad()
+    state_recur_enabled = bool(getattr(args, "state_recur_enabled", False))
+    state_recur_prob = (
+        float(getattr(args, "state_recur_prob", 0.3)) if state_recur_enabled else 0.0
+    )
 
     for data_iter_step, batch in enumerate(
         metric_logger.log_every(data_loader, args.print_freq, accelerator, header)
     ):
+        state_init_override, state_init_mask, state_recur_keys = build_state_recur_override(
+            batch,
+            state_recur_cache if state_recur_cache is not None else {},
+            state_recur_prob,
+        )
         with accelerator.accumulate(model):
             epoch_f = epoch + data_iter_step / len(data_loader)
             step = int(epoch_f * len(data_loader))
@@ -575,6 +676,8 @@ def train_one_epoch(
                     accelerator,
                     symmetrize_batch=False,
                     use_amp=bool(args.amp),
+                    state_init_override=state_init_override,
+                    state_init_mask=state_init_mask,
                 )
             else:
                 result = loss_of_one_batch_tbptt(
@@ -587,6 +690,8 @@ def train_one_epoch(
                     accelerator=accelerator,
                     symmetrize_batch=False,
                     use_amp=bool(args.amp),
+                    state_init_override=state_init_override,
+                    state_init_mask=state_init_mask,
                 )
             loss, loss_details = result["loss"]  # criterion returns two values
             bayesian_stats = result.get("bayesian")
@@ -604,6 +709,11 @@ def train_one_epoch(
                     bayesian_stats,
                     0.0,
                 )
+            update_state_recur_cache(
+                state_recur_cache if state_recur_cache is not None else {},
+                state_recur_keys,
+                result.get("state_cache_output"),
+            )
 
             loss_value = float(loss)
 
@@ -654,16 +764,16 @@ def train_one_epoch(
                 This calibrates different curves when batch size changes.
                 """
                 epoch_1000x = int(epoch_f * 1000)
-                log_writer.add_scalar("train_loss", loss_value_reduce, step)
-                log_writer.add_scalar("train_lr", lr, step)
-                log_writer.add_scalar("train_iter", epoch_1000x, step)
+                log_writer.add_scalar(join_metric_path("train", "loss"), loss_value_reduce, step)
+                log_writer.add_scalar(join_metric_path("train", "lr"), lr, step)
+                log_writer.add_scalar(join_metric_path("train", "iter_epoch_x1000"), epoch_1000x, step)
                 for name, val in loss_details.items():
                     if isinstance(val, torch.Tensor):
                         if val.ndim > 0:
                             continue
                     if isinstance(val, dict):
                         continue
-                    log_writer.add_scalar("train_" + name, val, step)
+                    log_writer.add_scalar(join_metric_path("train", name), val, step)
 
             if tb_vis_img:
                 if log_writer is None:
@@ -694,7 +804,7 @@ def train_one_epoch(
                 )
                 for name, imgs_stacked in imgs_stacked_dict.items():
                     log_writer.add_images(
-                        "train" + "/" + name, imgs_stacked, step, dataformats="HWC"
+                        join_metric_path("train", name), imgs_stacked, step, dataformats="HWC"
                     )
                 del batch
 
@@ -723,6 +833,7 @@ def test_one_epoch(
     args,
     log_writer=None,
     prefix="test",
+    global_step=None,
 ):
 
     model.eval()
@@ -774,13 +885,16 @@ def test_one_epoch(
     }
 
     if log_writer is not None:
+        metric_prefix = join_metric_path("test", prefix)
+        if global_step is None:
+            global_step = epoch
         for name, val in results.items():
             if isinstance(val, torch.Tensor):
                 if val.ndim > 0:
                     continue
             if isinstance(val, dict):
                 continue
-            log_writer.add_scalar(prefix + "_" + name, val, 1000 * epoch)
+            log_writer.add_scalar(join_metric_path(metric_prefix, name), val, global_step)
 
         depths_self, gt_depths_self = get_render_results(
             batch, result["pred"], self_view=True
@@ -802,7 +916,7 @@ def test_one_epoch(
         )
         for name, imgs_stacked in imgs_stacked_dict.items():
             log_writer.add_images(
-                prefix + "/" + name, imgs_stacked, 1000 * epoch, dataformats="HWC"
+                join_metric_path(metric_prefix, name), imgs_stacked, global_step, dataformats="HWC"
             )
 
     del loss_details, loss_value, batch

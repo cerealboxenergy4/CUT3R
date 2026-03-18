@@ -75,6 +75,8 @@ def loss_of_one_batch(
     inference=False,
     collect=False,
     skip_state=False,
+    state_init_override=None,
+    state_init_mask=None,
 ):
     if len(batch) > 2:
         assert (
@@ -84,11 +86,25 @@ def loss_of_one_batch(
         batch = make_batch_symmetric(batch)
     if accelerator is not None:
         batch = to_device(batch, accelerator.device, non_blocking=True)
+        if state_init_override is not None:
+            state_init_override = state_init_override.to(
+                accelerator.device, non_blocking=True
+            )
+        if state_init_mask is not None:
+            state_init_mask = state_init_mask.to(
+                accelerator.device, non_blocking=True
+            )
 
     autocast_enabled = bool(use_amp) and (not inference) and model.training
     with _cuda_bf16_autocast(enabled=autocast_enabled):
         if inference:
-            output, state_args = model(batch, ret_state=True, skip_state=skip_state)
+            output, state_args = model(
+                batch,
+                ret_state=True,
+                skip_state=skip_state,
+                state_init_override=state_init_override,
+                state_init_mask=state_init_mask,
+            )
             preds, batch = output.ress, output.views
             bayesian = _unwrap_model(model, accelerator).get_bayesian_stats()
             result = dict(views=batch, pred=preds, bayesian=bayesian)
@@ -97,14 +113,25 @@ def loss_of_one_batch(
                 return result, state_args, attn_seq
             return result[ret] if ret else result, state_args
         else:
-            output = model(batch)
+            output = model(
+                batch,
+                state_init_override=state_init_override,
+                state_init_mask=state_init_mask,
+            )
             preds, batch = output.ress, output.views
 
         with _cuda_bf16_autocast(enabled=False):
             loss = criterion(batch, preds) if criterion is not None else None
 
     bayesian = _unwrap_model(model, accelerator).get_bayesian_stats()
-    result = dict(views=batch, pred=preds, loss=loss, bayesian=bayesian)
+    state_cache_output = _unwrap_model(model, accelerator).pop_state_cache_output()
+    result = dict(
+        views=batch,
+        pred=preds,
+        loss=loss,
+        bayesian=bayesian,
+        state_cache_output=state_cache_output,
+    )
     return result[ret] if ret else result
 
 
@@ -122,6 +149,8 @@ def loss_of_one_batch_tbptt(
     ret=None,
     img_mask=None,
     inference=False,
+    state_init_override=None,
+    state_init_mask=None,
 ):
     if len(batch) > 2:
         assert (
@@ -131,6 +160,14 @@ def loss_of_one_batch_tbptt(
         batch = make_batch_symmetric(batch)
     if accelerator is not None:
         batch = to_device(batch, accelerator.device, non_blocking=True)
+        if state_init_override is not None:
+            state_init_override = state_init_override.to(
+                accelerator.device, non_blocking=True
+            )
+        if state_init_mask is not None:
+            state_init_mask = state_init_mask.to(
+                accelerator.device, non_blocking=True
+            )
     all_preds = []
     all_loss = 0.0
     all_loss_details = {}
@@ -143,7 +180,11 @@ def loss_of_one_batch_tbptt(
                 state_feat,
                 state_pos,
                 mem,
-            ) = accelerator.unwrap_model(model)._forward_encoder(batch)
+            ) = accelerator.unwrap_model(model)._forward_encoder(
+                batch,
+                state_init_override=state_init_override,
+                state_init_mask=state_init_mask,
+            )
         feat = [f.detach() for f in feat]
         pos = [p.detach() for p in pos]
         shape = [s.detach() for s in shape]
@@ -236,6 +277,7 @@ def loss_of_one_batch_tbptt(
         pred=all_preds,
         loss=(all_loss / ((len(batch) - 1) // chunk_size + 1), all_loss_details),
         bayesian=_unwrap_model(model, accelerator).get_bayesian_stats(),
+        state_cache_output=state_feat.detach().to(device="cpu", dtype=torch.float16),
         already_backprop=True,
     )
     return result[ret] if ret else result

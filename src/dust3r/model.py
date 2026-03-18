@@ -421,6 +421,7 @@ class ARCroco3DStereo(CroCoNet):
         self.collect_attention = False
         self.attn_dump_seq = None
         self.reset_bayesian_cache()
+        self._state_cache_output = None
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kw):
@@ -890,6 +891,17 @@ class ARCroco3DStereo(CroCoNet):
         self._bayesian_kl_sum = None
         self._bayesian_kl_count = 0
 
+    def _record_state_cache_output(self, state_feat):
+        if state_feat is None:
+            self._state_cache_output = None
+            return
+        self._state_cache_output = state_feat.detach().to(device="cpu", dtype=torch.float16)
+
+    def pop_state_cache_output(self):
+        state = self._state_cache_output
+        self._state_cache_output = None
+        return state
+
     def _update_granular_bayesian_stats(self, alpha_tensor, kl_loss=None):
         alpha_flat = alpha_tensor.detach().reshape(-1)
         if self._bayesian_alpha_stats is None:
@@ -939,6 +951,18 @@ class ARCroco3DStereo(CroCoNet):
         if feat is None:
             return None
         return feat.mean(dim=1)
+
+    def _apply_state_init_override(self, fresh_state_feat, state_init_override, state_init_mask):
+        if state_init_override is None or state_init_mask is None:
+            return fresh_state_feat
+        override = state_init_override.to(
+            device=fresh_state_feat.device,
+            dtype=fresh_state_feat.dtype,
+        )
+        mask = state_init_mask.to(device=fresh_state_feat.device, dtype=fresh_state_feat.dtype)
+        while mask.ndim < fresh_state_feat.ndim:
+            mask = mask.unsqueeze(-1)
+        return override * mask + fresh_state_feat * (1.0 - mask)
 
     def _compose_granular_posterior_input(self, state_feat, current_feat, pose_feat):
         pooled_state = self._pool_feature_for_posterior(state_feat)
@@ -1252,13 +1276,17 @@ class ARCroco3DStereo(CroCoNet):
     def _get_img_level_feat(self, feat):
         return torch.mean(feat, dim=1, keepdim=True)
 
-    def _forward_encoder(self, views):
+    def _forward_encoder(self, views, state_init_override=None, state_init_mask=None):
         self.reset_bayesian_cache()
         shape, feat_ls, pos = self._encode_views(views)
         feat = feat_ls[-1]
         state_feat, state_pos = self._init_state(feat[0], pos[0])
+        fresh_init_state_feat = state_feat.clone()
+        state_feat = self._apply_state_init_override(
+            state_feat, state_init_override, state_init_mask
+        )
         mem = self.pose_retriever.mem.expand(feat[0].shape[0], -1, -1)
-        init_state_feat = state_feat.clone()
+        init_state_feat = fresh_init_state_feat
         init_mem = mem.clone()
         return (feat, pos, shape), (
             init_state_feat,
@@ -1334,7 +1362,7 @@ class ARCroco3DStereo(CroCoNet):
             mem = init_mem * reset_mask + mem * (1 - reset_mask)
         return res, (state_feat, mem)
 
-    def _forward_impl(self, views, ret_state=False):
+    def _forward_impl(self, views, ret_state=False, state_init_override=None, state_init_mask=None):
         # initialize attention sequence if collect_attention is True
         if self.collect_attention is True:
             self.attn_dump_seq = []
@@ -1343,8 +1371,12 @@ class ARCroco3DStereo(CroCoNet):
         shape, feat_ls, pos = self._encode_views(views)
         feat = feat_ls[-1]
         state_feat, state_pos = self._init_state(feat[0], pos[0])
+        fresh_init_state_feat = state_feat.clone()
+        state_feat = self._apply_state_init_override(
+            state_feat, state_init_override, state_init_mask
+        )
         mem = self.pose_retriever.mem.expand(feat[0].shape[0], -1, -1)
-        init_state_feat = state_feat.clone()
+        init_state_feat = fresh_init_state_feat
         init_mem = mem.clone()
         all_state_args = [
             (state_feat, state_pos, init_state_feat, mem, init_mem)
@@ -1415,11 +1447,12 @@ class ARCroco3DStereo(CroCoNet):
             all_state_args.append(
                 (state_feat, state_pos, init_state_feat, mem, init_mem)
             )
+        self._record_state_cache_output(state_feat)
         if ret_state:
             return ress, views, all_state_args
         return ress, views
 
-    def _forward_impl_skip_state_updates(self, views, ret_state=False):
+    def _forward_impl_skip_state_updates(self, views, ret_state=False, state_init_override=None, state_init_mask=None):
         # initialize attention sequence if collect_attention is True
         if self.collect_attention is True:
             self.attn_dump_seq = []
@@ -1428,8 +1461,12 @@ class ARCroco3DStereo(CroCoNet):
         shape, feat_ls, pos = self._encode_views(views)
         feat = feat_ls[-1]
         state_feat, state_pos = self._init_state(feat[0], pos[0])
+        fresh_init_state_feat = state_feat.clone()
+        state_feat = self._apply_state_init_override(
+            state_feat, state_init_override, state_init_mask
+        )
         mem = self.pose_retriever.mem.expand(feat[0].shape[0], -1, -1)
-        init_state_feat = state_feat.clone()
+        init_state_feat = fresh_init_state_feat
         init_mem = mem.clone()
         state_holder= state_feat.clone()
         all_state_args = [
@@ -1506,24 +1543,50 @@ class ARCroco3DStereo(CroCoNet):
             if i % 2 == 0:
                 state_holder = state_feat
 
+        self._record_state_cache_output(state_feat)
         if ret_state:
             return ress, views, all_state_args
         return ress, views
 
-    def forward(self, views, ret_state=False, skip_state=False):
+    def forward(
+        self,
+        views,
+        ret_state=False,
+        skip_state=False,
+        state_init_override=None,
+        state_init_mask=None,
+    ):
         if ret_state:
             if skip_state:
-                ress, views, state_args = self._forward_impl_skip_state_updates(views, ret_state=ret_state)
+                ress, views, state_args = self._forward_impl_skip_state_updates(
+                    views,
+                    ret_state=ret_state,
+                    state_init_override=state_init_override,
+                    state_init_mask=state_init_mask,
+                )
                 return ARCroco3DStereoOutput(ress=ress, views=views), state_args
-            ress, views, state_args = self._forward_impl(views, ret_state=ret_state)
+            ress, views, state_args = self._forward_impl(
+                views,
+                ret_state=ret_state,
+                state_init_override=state_init_override,
+                state_init_mask=state_init_mask,
+            )
             return ARCroco3DStereoOutput(ress=ress, views=views), state_args
         else:
             if skip_state:
                 ress, views, state_args = self._forward_impl_skip_state_updates(
-                    views, ret_state=ret_state
+                    views,
+                    ret_state=ret_state,
+                    state_init_override=state_init_override,
+                    state_init_mask=state_init_mask,
                 )
                 return ARCroco3DStereoOutput(ress=ress, views=views), state_args
-            ress, views = self._forward_impl(views, ret_state=ret_state)
+            ress, views = self._forward_impl(
+                views,
+                ret_state=ret_state,
+                state_init_override=state_init_override,
+                state_init_mask=state_init_mask,
+            )
             return ARCroco3DStereoOutput(ress=ress, views=views)
      
     def inference_step(
