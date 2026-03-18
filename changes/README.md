@@ -30,3 +30,4 @@ Chronological list of changes in this repository.
 - 2026-03-16_14:21:25 - Reduce granular VRAM usage - changes/2026-03-16_14:21:25_reduce-granular-vram.md
 - 2026-03-17_10:47:20 - Add granular LoRA training - changes/2026-03-17_10:47:20_add-granular-lora-training.md
 - 2026-03-18_10:31:35 - Add state recurrence cache - changes/2026-03-18_10:31:35_add-state-recur-cache.md
+- 2026-03-18_10:55:09 - Fix state-recur smoke bugs - changes/2026-03-18_10:55:09_fix-state-recur-smoke-bugs.md

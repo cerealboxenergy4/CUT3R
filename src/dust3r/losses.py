@@ -508,8 +508,8 @@ class Regr3DPose(Criterion, MultiLoss):
         pr_poses = [
             (pr[:, :3] / pose_norm_factor_pr.clip(eps), pr[:, 3:]) for pr in pr_poses
         ]
-        pose_masks = (pose_norm_factor_gt.squeeze() > eps) & (
-            pose_norm_factor_pr.squeeze() > eps
+        pose_masks = (pose_norm_factor_gt.reshape(-1) > eps) & (
+            pose_norm_factor_pr.reshape(-1) > eps
         )
 
         if any(camera_only):
@@ -676,8 +676,8 @@ class Regr3DPose(Criterion, MultiLoss):
             (pr[:, :3] / pose_norm_factor_pr.clip(eps), pr[:, 3:]) for pr in pr_poses
         ]
 
-        pose_masks = (pose_norm_factor_gt.squeeze() > eps) & (
-            pose_norm_factor_pr.squeeze() > eps
+        pose_masks = (pose_norm_factor_gt.reshape(-1) > eps) & (
+            pose_norm_factor_pr.reshape(-1) > eps
         )
 
         if any(camera_only):

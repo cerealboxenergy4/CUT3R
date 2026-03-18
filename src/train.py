@@ -415,8 +415,7 @@ def train(args):
         # Save immediately the last checkpoint
         if epoch > args.start_epoch:
             if (
-                args.save_freq
-                and np.allclose(epoch / args.save_freq, int(epoch / args.save_freq))
+                (args.save_freq and np.allclose(epoch / args.save_freq, int(epoch / args.save_freq)))
                 or epoch == args.epochs
             ):
                 save_model(epoch - 1, "last", best_so_far)
@@ -808,8 +807,12 @@ def train_one_epoch(
                     )
                 del batch
 
+        save_every_steps = (
+            int(args.save_freq * len(data_loader)) if args.save_freq else 0
+        )
         if (
-            data_iter_step % int(args.save_freq * len(data_loader)) == 0
+            save_every_steps > 0
+            and data_iter_step % save_every_steps == 0
             and data_iter_step != 0
             and data_iter_step != len(data_loader) - 1
         ):
