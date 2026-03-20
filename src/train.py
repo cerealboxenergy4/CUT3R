@@ -575,7 +575,22 @@ def update_state_recur_cache(state_cache, keys, state_cache_output):
         state_cache[key] = state_cache_output[index].clone()
 
 
-def apply_bayesian_regularizer(loss, loss_details, bayesian_stats, kl_weight):
+def get_bayesian_kl_weight(model: torch.nn.Module) -> float:
+    config = getattr(model, "config", None)
+    if config is not None and hasattr(config, "bayesian_kl_weight"):
+        return float(config.bayesian_kl_weight)
+    if hasattr(model, "bayesian_kl_weight"):
+        return float(model.bayesian_kl_weight)
+    return 0.0
+
+
+def apply_bayesian_regularizer(
+    loss,
+    loss_details,
+    bayesian_stats,
+    kl_weight,
+    configured_kl_weight=None,
+):
     if loss_details is None:
         loss_details = {}
     else:
@@ -593,12 +608,20 @@ def apply_bayesian_regularizer(loss, loss_details, bayesian_stats, kl_weight):
     if "omega" in bayesian_stats:
         loss_details["bayes_omega_sum"] = float(bayesian_stats["omega"].sum().detach())
 
+    if configured_kl_weight is None:
+        configured_kl_weight = kl_weight
+
     kl_loss = bayesian_stats["kl_loss"]
     weighted_kl = kl_weight * kl_loss
+    configured_weighted_kl = configured_kl_weight * kl_loss
     loss_details["task_loss"] = float(loss.detach())
     loss_details["bayes_kl"] = float(kl_loss.detach())
     loss_details["bayes_kl_weight"] = kl_weight
     loss_details["bayes_kl_weighted"] = float(weighted_kl.detach())
+    loss_details["bayes_kl_weight_configured"] = configured_kl_weight
+    loss_details["bayes_kl_weighted_configured"] = float(
+        configured_weighted_kl.detach()
+    )
 
     if kl_weight <= 0:
         return loss, loss_details
@@ -697,12 +720,17 @@ def train_one_epoch(
                 )
             loss, loss_details = result["loss"]  # criterion returns two values
             bayesian_stats = result.get("bayesian")
-            kl_weight = float(
-                getattr(accelerator.unwrap_model(model).config, "bayesian_kl_weight", 0.0)
+            configured_kl_weight = get_bayesian_kl_weight(
+                accelerator.unwrap_model(model)
             )
+            kl_weight = configured_kl_weight
             if not result.get("already_backprop", False):
                 loss, loss_details = apply_bayesian_regularizer(
-                    loss, loss_details, bayesian_stats, kl_weight
+                    loss,
+                    loss_details,
+                    bayesian_stats,
+                    kl_weight,
+                    configured_kl_weight=configured_kl_weight,
                 )
             elif bayesian_stats and bayesian_stats.get("enabled", False):
                 _, loss_details = apply_bayesian_regularizer(
@@ -710,6 +738,7 @@ def train_one_epoch(
                     loss_details,
                     bayesian_stats,
                     0.0,
+                    configured_kl_weight=configured_kl_weight,
                 )
             update_state_recur_cache(
                 state_recur_cache if state_recur_cache is not None else {},
@@ -873,11 +902,15 @@ def test_one_epoch(
 
         loss_value, loss_details = result["loss"]  # criterion returns two values
         bayesian_stats = result.get("bayesian")
+        configured_kl_weight = get_bayesian_kl_weight(accelerator.unwrap_model(model))
         _, loss_details = apply_bayesian_regularizer(
-            loss_value if isinstance(loss_value, torch.Tensor) else torch.as_tensor(loss_value, device=device),
+            loss_value
+            if isinstance(loss_value, torch.Tensor)
+            else torch.as_tensor(loss_value, device=device),
             loss_details,
             bayesian_stats,
             0.0,
+            configured_kl_weight=configured_kl_weight,
         )
         metric_logger.update(loss=float(loss_value), **loss_details)
 
