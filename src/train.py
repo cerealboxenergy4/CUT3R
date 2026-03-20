@@ -1172,23 +1172,31 @@ def get_vis_imgs_new(loss_details, num_imgs_vis, num_views, is_metric):
     else:
         stride = 1
     for i in range(0, num_views, stride):
-        gt_imgs = 0.5 * (loss_details[f"gt_img{i+1}"] + 1)[:num_imgs_vis].detach().cpu()
-        width = gt_imgs.shape[2]
-        pred_imgs = (
-            0.5 * (loss_details[f"pred_rgb_{i+1}"] + 1)[:num_imgs_vis].detach().cpu()
-        )
-        gt_img_list = batch_append(gt_img_list, gt_imgs.unbind(dim=0))
-        pred_img_list = batch_append(pred_img_list, pred_imgs.unbind(dim=0))
-
         cross_pred_depths = (
             loss_details[f"pred_depth_{i+1}"][:num_imgs_vis].detach().cpu()
         )
         cross_gt_depths = (
-            loss_details[f"gt_depth_{i+1}"]
-            .to(gt_imgs.device)[:num_imgs_vis]
-            .detach()
-            .cpu()
+            loss_details[f"gt_depth_{i+1}"][:num_imgs_vis].detach().cpu()
         )
+        rgb_shape = (*cross_pred_depths.shape, 3)
+        gt_img_key = f"gt_img{i+1}"
+        pred_img_key = f"pred_rgb_{i+1}"
+        if gt_img_key in loss_details:
+            gt_imgs = (
+                0.5 * (loss_details[gt_img_key] + 1)[:num_imgs_vis].detach().cpu()
+            )
+        else:
+            gt_imgs = torch.zeros(rgb_shape, dtype=torch.float32)
+        width = gt_imgs.shape[2]
+        if pred_img_key in loss_details:
+            pred_imgs = (
+                0.5 * (loss_details[pred_img_key] + 1)[:num_imgs_vis].detach().cpu()
+            )
+        else:
+            pred_imgs = torch.zeros_like(gt_imgs)
+        gt_img_list = batch_append(gt_img_list, gt_imgs.unbind(dim=0))
+        pred_img_list = batch_append(pred_img_list, pred_imgs.unbind(dim=0))
+
         cross_pred_depth_list = batch_append(
             cross_pred_depth_list, cross_pred_depths.unbind(dim=0)
         )
