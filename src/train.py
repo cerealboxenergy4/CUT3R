@@ -593,14 +593,17 @@ def apply_bayesian_regularizer(loss, loss_details, bayesian_stats, kl_weight):
     if "omega" in bayesian_stats:
         loss_details["bayes_omega_sum"] = float(bayesian_stats["omega"].sum().detach())
 
-    if kl_weight <= 0:
-        return loss, loss_details
-
     kl_loss = bayesian_stats["kl_loss"]
+    weighted_kl = kl_weight * kl_loss
     loss_details["task_loss"] = float(loss.detach())
     loss_details["bayes_kl"] = float(kl_loss.detach())
     loss_details["bayes_kl_weight"] = kl_weight
-    return loss + kl_weight * kl_loss, loss_details
+    loss_details["bayes_kl_weighted"] = float(weighted_kl.detach())
+
+    if kl_weight <= 0:
+        return loss, loss_details
+
+    return loss + weighted_kl, loss_details
 
 
 def train_one_epoch(

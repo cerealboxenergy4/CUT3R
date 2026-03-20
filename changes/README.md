@@ -31,3 +31,4 @@ Chronological list of changes in this repository.
 - 2026-03-17_10:47:20 - Add granular LoRA training - changes/2026-03-17_10:47:20_add-granular-lora-training.md
 - 2026-03-18_10:31:35 - Add state recurrence cache - changes/2026-03-18_10:31:35_add-state-recur-cache.md
 - 2026-03-18_10:55:09 - Fix state-recur smoke bugs - changes/2026-03-18_10:55:09_fix-state-recur-smoke-bugs.md
+- 2026-03-20_10:25:46 - Log bayesian KL metrics - changes/2026-03-20_10:25:46_log-bayesian-kl-metrics.md
