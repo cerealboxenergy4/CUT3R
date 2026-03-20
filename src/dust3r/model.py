@@ -921,11 +921,10 @@ class ARCroco3DStereo(CroCoNet):
             stats["min"] = torch.minimum(stats["min"], alpha_flat.min())
             stats["max"] = torch.maximum(stats["max"], alpha_flat.max())
         if kl_loss is not None:
-            kl_detached = kl_loss.detach()
             if self._bayesian_kl_sum is None:
-                self._bayesian_kl_sum = kl_detached
+                self._bayesian_kl_sum = kl_loss
             else:
-                self._bayesian_kl_sum = self._bayesian_kl_sum + kl_detached
+                self._bayesian_kl_sum = self._bayesian_kl_sum + kl_loss
             self._bayesian_kl_count += 1
 
     def _count_bayesian_decoder_weights(self, layer_idx):

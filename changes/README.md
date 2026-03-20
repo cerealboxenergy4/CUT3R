@@ -36,3 +36,4 @@ Chronological list of changes in this repository.
 - 2026-03-20_14:08:11 - Add RGB loss config toggle - changes/2026-03-20_14:08:11_add-rgb-loss-config-toggle.md
 - 2026-03-20_14:48:23 - Guard RGB visualization when disabled - changes/2026-03-20_14:48:23_guard-rgb-vis-when-disabled.md
 - 2026-03-20_15:31:46 - Restore bayesian KL config on model - changes/2026-03-20_15:31:46_restore-bayesian-kl-config-on-model.md
+- 2026-03-20_16:21:46 - Enable granular KL backprop - changes/2026-03-20_16:21:46_enable-granular-kl-backprop.md
