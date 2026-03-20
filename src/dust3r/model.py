@@ -280,11 +280,11 @@ class ARCroco3DStereo(CroCoNet):
         config.croco_kwargs = fill_default_args(
             config.croco_kwargs, CrocoConfig.__init__
         )
-        self.config = config
         self.patch_embed_cls = config.patch_embed_cls
         self.croco_args = config.croco_kwargs
         croco_cfg = CrocoConfig(**self.croco_args)
         super().__init__(croco_cfg)
+        self.config = config
         self.enc_blocks_ray_map = nn.ModuleList(
             [
                 Block(
@@ -312,6 +312,7 @@ class ARCroco3DStereo(CroCoNet):
         self.bayesian_alpha_min = config.bayesian_alpha_min
         self.bayesian_alpha_max = config.bayesian_alpha_max
         self.bayesian_sigma = config.bayesian_sigma
+        self.bayesian_kl_weight = config.bayesian_kl_weight
         self.bayesian_sample_inference = config.bayesian_sample_inference
         self.bayesian_inference_mode = config.bayesian_inference_mode
         self.bayesian_posterior_logvar_min = config.bayesian_posterior_logvar_min

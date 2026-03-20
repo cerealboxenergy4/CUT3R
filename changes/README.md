@@ -35,3 +35,4 @@ Chronological list of changes in this repository.
 - 2026-03-20_14:04:45 - Log configured KL metrics in eval - changes/2026-03-20_14:04:45_log-configured-kl-in-eval.md
 - 2026-03-20_14:08:11 - Add RGB loss config toggle - changes/2026-03-20_14:08:11_add-rgb-loss-config-toggle.md
 - 2026-03-20_14:48:23 - Guard RGB visualization when disabled - changes/2026-03-20_14:48:23_guard-rgb-vis-when-disabled.md
+- 2026-03-20_15:31:46 - Restore bayesian KL config on model - changes/2026-03-20_15:31:46_restore-bayesian-kl-config-on-model.md
