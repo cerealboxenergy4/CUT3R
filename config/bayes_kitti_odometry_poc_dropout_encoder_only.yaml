@@ -1,0 +1,71 @@
+model: "ARCroco3DStereo(ARCroco3DStereoConfig(freeze='dropout_encoder_only', state_size=768, state_pe='2d', pos_embed='RoPE100', rgb_head=True, pose_head=True, patch_embed_cls='ManyAR_PatchEmbed', use_bayesian_decoder=True, bayesian_alpha_init=1.0, bayesian_alpha_min=0.5, bayesian_alpha_max=1.5, bayesian_sigma=1e-3, bayesian_kl_weight=1e-6, bayesian_sample_inference=False, img_size=(512, 512), head_type='dpt', output_mode='pts3d+pose', depth_mode=('exp', -inf, inf), conf_mode=('exp', 1, inf), pose_mode=('exp', -inf, inf), enc_embed_dim=1024, enc_depth=24, enc_num_heads=16, dec_embed_dim=768, dec_depth=12, dec_num_heads=12, landscape_only=False))"
+pretrained: /home/hunn/projects/checkpoints/cut3r_512_dpt_4_64_bayes_decoder_init.pth
+load_only_encoder: False
+long_context: False
+fixed_length: True
+resume: null
+auto_resume: false
+reset_bayesian_dropout_encoder: true
+benchmark: False
+num_views: 32
+num_test_views: 32
+n_corres_train: 0
+n_corres_test: 0
+
+train_criterion: ConfLoss(Regr3DPoseBatchList(L21, norm_mode='?avg_dis'), alpha=0.2) + RGBLoss(MSE)
+test_criterion: Regr3DPose(L21, norm_mode='?avg_dis', gt_scale=True, sky_loss_value=0) + Regr3DPose_ScaleInv(L21, norm_mode='?avg_dis', gt_scale=True, sky_loss_value=0) + RGBLoss(L21)
+
+kitti_train: KITTIOdometry_Multi(split=None, ROOT='../../datasets/kitti_odometry', sequences=('01','02','03','04','05','06','07','08','09','10'), camera='image_2', max_interval=5, resolution=[(512, 384), (512, 336), (512, 288), (512, 256)], transform=SeqColorJitter, num_views=${num_views}, n_corres=${n_corres_train})
+kitti_test: KITTIOdometry_Multi(split=None, ROOT='../../datasets/kitti_odometry', sequences=('00',), camera='image_2', max_interval=3, resolution=(512, 384), transform=SeqColorJitter, num_views=${num_test_views}, n_corres=${n_corres_test}, seed=42)
+
+train_dataset: 100 @ ${kitti_train}
+test_dataset: 100 @ ${kitti_test}
+
+seed: 0
+batch_size: 2
+accum_iter: 1
+gradient_checkpointing: True
+epochs: 1
+start_epoch: 0
+weight_decay: 0.05
+lr: 4e-5
+min_lr: 1e-6
+warmup_epochs: 0.25
+amp: 1
+mixed_precision: 'no'
+
+num_workers: 8
+world_size: 1
+local-rank: -1
+dist_url: 'env://'
+rank: 0
+gpu: 0
+distributed: False
+dist_backend: 'nccl'
+
+eval_freq: 10
+save_freq: 100
+keep_freq: 100
+print_freq: 10
+print_img_freq: 5000
+num_imgs_vis: 2
+save_dir: 'checkpoints'
+exp_name: 'bayes_kitti_odometry_poc_dropout_encoder_only'
+task: 'cut3r'
+logdir: ./${save_dir}/${exp_name}/logs
+output_dir: ./${save_dir}/${exp_name}/
+hydra:
+  verbose: False
+  run:
+    dir: ./${save_dir}/${exp_name}
+
+wandb:
+  enabled: true
+  entity: bayes-cut3r
+  project: bayes-cut3r
+  name: null
+  group: null
+  tags: []
+  mode: online
+  init_timeout: 30
+  allow_offline_fallback: true

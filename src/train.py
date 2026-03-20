@@ -12,6 +12,7 @@ import os
 import sys
 import time
 import math
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Sized
@@ -57,6 +58,175 @@ import torch.multiprocessing
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 printer = get_logger(__name__, log_level="DEBUG")
+
+
+class TrainLogger:
+    def __init__(self, tensorboard_writer=None, wandb_run=None, wandb_module=None):
+        self.tensorboard_writer = tensorboard_writer
+        self.wandb_run = wandb_run
+        self.wandb = wandb_module
+        if tensorboard_writer is not None:
+            self.log_dir = tensorboard_writer.log_dir
+        elif wandb_run is not None:
+            self.log_dir = getattr(wandb_run, "dir", "")
+        else:
+            self.log_dir = ""
+
+    def add_scalar(self, name, value, step):
+        if self.tensorboard_writer is not None:
+            self.tensorboard_writer.add_scalar(name, value, step)
+        if self.wandb_run is not None and isinstance(value, (float, int)) and math.isfinite(value):
+            self.wandb_run.log({name: value}, step=step)
+
+    def add_images(self, name, images, step, dataformats="HWC"):
+        if self.tensorboard_writer is not None:
+            self.tensorboard_writer.add_images(name, images, step, dataformats=dataformats)
+        if self.wandb_run is None:
+            return
+        if isinstance(images, torch.Tensor):
+            image_array = images.detach().cpu()
+            if image_array.ndim > 3:
+                image_array = image_array[0]
+            image_array = image_array.numpy()
+        else:
+            image_array = np.asarray(images)
+            if image_array.ndim > 3:
+                image_array = image_array[0]
+        self.wandb_run.log({name: self.wandb.Image(image_array)}, step=step)
+
+    def log_metrics(self, metrics, step):
+        if self.wandb_run is None:
+            return
+        payload = {
+            key: value
+            for key, value in metrics.items()
+            if isinstance(value, (float, int)) and math.isfinite(value)
+        }
+        if payload:
+            self.wandb_run.log(payload, step=step)
+
+    def flush(self):
+        if self.tensorboard_writer is not None:
+            self.tensorboard_writer.flush()
+
+    def close(self):
+        if self.tensorboard_writer is not None:
+            self.tensorboard_writer.close()
+        if self.wandb_run is not None:
+            self.wandb_run.finish()
+
+
+def sanitize_metric_component(value: str) -> str:
+    value = value.strip()
+    value = re.sub(r"^\s*\d+\s*@\s*", "", value)
+    value = re.sub(r"[^0-9a-zA-Z]+", "_", value)
+    value = value.strip("_").lower()
+    return value or "metric"
+
+
+def build_test_metric_name(dataset_expr: str, seen_names: dict[str, int]) -> str:
+    dataset_name = dataset_expr.split("(", 1)[0]
+    base_name = sanitize_metric_component(dataset_name)
+    seen_names[base_name] += 1
+    if seen_names[base_name] > 1:
+        return f"{base_name}_{seen_names[base_name]}"
+    return base_name
+
+
+def join_metric_path(*parts: str) -> str:
+    return "/".join(part.strip("/") for part in parts if part)
+
+
+def split_top_level_terms(expr: str) -> list[str]:
+    terms = []
+    current = []
+    depth = 0
+    for char in expr:
+        if char == "(":
+            depth += 1
+        elif char == ")" and depth > 0:
+            depth -= 1
+        if char == "+" and depth == 0:
+            term = "".join(current).strip()
+            if term:
+                terms.append(term)
+            current = []
+            continue
+        current.append(char)
+    tail = "".join(current).strip()
+    if tail:
+        terms.append(tail)
+    return terms
+
+
+def build_criterion_expr(expr: str, use_rgb_loss: bool, split_name: str) -> str:
+    if use_rgb_loss:
+        return expr
+
+    filtered_terms = [
+        term for term in split_top_level_terms(expr) if not term.startswith("RGBLoss(")
+    ]
+    if not filtered_terms:
+        raise ValueError(
+            f"{split_name} criterion became empty after removing RGBLoss terms: {expr}"
+        )
+    filtered_expr = " + ".join(filtered_terms)
+    printer.info(
+        "RGB loss disabled for %s split. criterion: %s -> %s",
+        split_name,
+        expr,
+        filtered_expr,
+    )
+    return filtered_expr
+
+
+def build_logger(args, accelerator):
+    if not accelerator.is_main_process:
+        return None
+
+    tensorboard_writer = SummaryWriter(log_dir=args.output_dir)
+    wandb_cfg = getattr(args, "wandb", None)
+    if not getattr(wandb_cfg, "enabled", False):
+        return TrainLogger(tensorboard_writer=tensorboard_writer)
+
+    try:
+        import wandb
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "wandb logging is enabled but the 'wandb' package is not installed in the current environment."
+        ) from exc
+
+    cfg_dict = OmegaConf.to_container(args, resolve=True)
+    tags = getattr(wandb_cfg, "tags", None)
+    if isinstance(tags, str):
+        tags = [tag for tag in tags.split(",") if tag]
+    init_kwargs = dict(
+        project=getattr(wandb_cfg, "project", "bayes_cut3r"),
+        entity=getattr(wandb_cfg, "entity", None),
+        name=getattr(wandb_cfg, "name", None) or args.exp_name,
+        group=getattr(wandb_cfg, "group", None),
+        tags=tags,
+        mode=getattr(wandb_cfg, "mode", "online"),
+        dir=args.output_dir,
+        config=cfg_dict,
+        settings=wandb.Settings(init_timeout=getattr(wandb_cfg, "init_timeout", 30)),
+    )
+    try:
+        run = wandb.init(**init_kwargs)
+    except Exception as exc:
+        if init_kwargs["mode"] != "online" or not getattr(wandb_cfg, "allow_offline_fallback", True):
+            raise
+        printer.warning(
+            "wandb.init() failed in online mode (%s). Falling back to offline mode.",
+            exc,
+        )
+        init_kwargs["mode"] = "offline"
+        run = wandb.init(**init_kwargs)
+    return TrainLogger(
+        tensorboard_writer=tensorboard_writer,
+        wandb_run=run,
+        wandb_module=wandb,
+    )
 
 
 def setup_for_distributed(accelerator: Accelerator):
@@ -110,7 +280,7 @@ def train(args):
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.accum_iter,
-        mixed_precision="bf16",
+        mixed_precision=getattr(args, "mixed_precision", "bf16"),
         kwargs_handlers=[
             DistributedDataParallelKwargs(find_unused_parameters=True),
             InitProcessGroupKwargs(timeout=timedelta(seconds=6000)),
@@ -124,12 +294,8 @@ def train(args):
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
-    if accelerator.is_main_process:
-        dst_dir = save_current_code(outdir=args.output_dir)
-        printer.info(f"Saving current code to {dst_dir}")
-
     # auto resume
-    if not args.resume:
+    if args.resume is None and getattr(args, "auto_resume", True):
         last_ckpt_fname = os.path.join(args.output_dir, f"checkpoint-last.pth")
         args.resume = last_ckpt_fname if os.path.isfile(last_ckpt_fname) else None
 
@@ -157,8 +323,11 @@ def train(args):
         fixed_length=args.fixed_length
     )
     printer.info("Building test dataset %s", args.test_dataset)
-    data_loader_test = {
-        dataset.split("(")[0]: build_dataset(
+    data_loader_test = {}
+    seen_test_names = defaultdict(int)
+    for dataset in args.test_dataset.split("+"):
+        test_name = build_test_metric_name(dataset, seen_test_names)
+        data_loader_test[test_name] = build_dataset(
             dataset,
             args.batch_size,
             args.num_workers,
@@ -166,8 +335,6 @@ def train(args):
             test=True,
             fixed_length=True
         )
-        for dataset in args.test_dataset.split("+")
-    }
 
     # model
     printer.info("Loading model: %s", args.model)
@@ -180,23 +347,30 @@ def train(args):
         f"Decoder parameters: {sum(p.numel() for p in model.dec_blocks.parameters())}"
     )
 
-    printer.info(f">> Creating train criterion = {args.train_criterion}")
-    train_criterion = eval(args.train_criterion).to(device)
-    printer.info(
-        f">> Creating test criterion = {args.test_criterion or args.train_criterion}"
+    use_rgb_loss_default = bool(getattr(args, "use_rgb_loss", False))
+    train_use_rgb_loss = bool(
+        getattr(args, "train_use_rgb_loss", use_rgb_loss_default)
     )
-    test_criterion = eval(args.test_criterion or args.criterion).to(device)
+    test_use_rgb_loss = bool(
+        getattr(args, "test_use_rgb_loss", train_use_rgb_loss)
+    )
+    train_criterion_expr = build_criterion_expr(
+        args.train_criterion, train_use_rgb_loss, "train"
+    )
+    test_criterion_expr = build_criterion_expr(
+        args.test_criterion or args.train_criterion, test_use_rgb_loss, "test"
+    )
 
-    model.to(device)
-
-    if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
-    if args.long_context:
-        model.fixed_input_length = False
+    printer.info(f">> Creating train criterion = {train_criterion_expr}")
+    train_criterion = eval(train_criterion_expr).to(device)
+    printer.info(
+        f">> Creating test criterion = {test_criterion_expr}"
+    )
+    test_criterion = eval(test_criterion_expr).to(device)
 
     if args.pretrained and not args.resume:
         printer.info(f"Loading pretrained: {args.pretrained}")
-        ckpt = torch.load(args.pretrained, map_location=device)
+        ckpt = torch.load(args.pretrained, map_location="cpu")
         load_only_encoder = getattr(args, "load_only_encoder", False)
         if load_only_encoder:
             filtered_state_dict = {
@@ -212,6 +386,16 @@ def train(args):
                 model.load_state_dict(strip_module(ckpt["model"]), strict=False)
             )
         del ckpt  # in case it occupies memory
+    if getattr(args, "reset_bayesian_dropout_encoder", False):
+        printer.info("Resetting bayesian dropout encoder after model load")
+        model.reset_bayesian_dropout_encoder()
+
+    model.to(device)
+
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+    if args.long_context:
+        model.fixed_input_length = False
 
     # # following timm: set wd as 0 for bias and norm layers
     param_groups = misc.get_parameter_groups(model, args.weight_decay)
@@ -220,14 +404,22 @@ def train(args):
     loss_scaler = NativeScaler(accelerator=accelerator)
 
     accelerator.even_batches = False
+    printer.info(
+        "[RANK %s] Starting accelerator.prepare()",
+        accelerator.process_index,
+    )
     optimizer, model, data_loader_train = accelerator.prepare(
         optimizer, model, data_loader_train
+    )
+    printer.info(
+        "[RANK %s] Finished accelerator.prepare()",
+        accelerator.process_index,
     )
 
     def write_log_stats(epoch, train_stats, test_stats):
         if accelerator.is_main_process:
-            if log_writer is not None:
-                log_writer.flush()
+            if logger is not None:
+                logger.flush()
 
             log_stats = dict(
                 epoch=epoch, **{f"train_{k}": v for k, v in train_stats.items()}
@@ -243,6 +435,9 @@ def train(args):
                 os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8"
             ) as f:
                 f.write(json.dumps(log_stats) + "\n")
+            if logger is not None:
+                # Keep W&B/TensorBoard on the same monotonic train-step axis.
+                logger.add_scalar("meta/epoch", epoch, epoch * len(data_loader_train))
 
     def save_model(epoch, fname, best_so_far):
         misc.save_model(
@@ -256,14 +451,17 @@ def train(args):
             best_so_far=best_so_far,
         )
 
+    printer.info("[RANK %s] Loading resume state", accelerator.process_index)
     best_so_far = misc.load_model(
         args=args, model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler
     )
+    printer.info("[RANK %s] Resume state ready", accelerator.process_index)
     if best_so_far is None:
         best_so_far = float("inf")
-    log_writer = (
-        SummaryWriter(log_dir=args.output_dir) if accelerator.is_main_process else None
-    )
+    printer.info("[RANK %s] Building experiment logger", accelerator.process_index)
+    logger = build_logger(args, accelerator)
+    printer.info("[RANK %s] Logger ready", accelerator.process_index)
+    state_recur_cache = {}
 
     printer.info(f"Start training for {args.epochs} epochs")
     start_time = time.time()
@@ -274,8 +472,7 @@ def train(args):
         # Save immediately the last checkpoint
         if epoch > args.start_epoch:
             if (
-                args.save_freq
-                and np.allclose(epoch / args.save_freq, int(epoch / args.save_freq))
+                (args.save_freq and np.allclose(epoch / args.save_freq, int(epoch / args.save_freq)))
                 or epoch == args.epochs
             ):
                 save_model(epoch - 1, "last", best_so_far)
@@ -292,9 +489,10 @@ def train(args):
                     accelerator,
                     device,
                     epoch,
-                    log_writer=log_writer,
+                    log_writer=logger,
                     args=args,
                     prefix=test_name,
+                    global_step=epoch * len(data_loader_train),
                 )
                 test_stats[test_name] = stats
 
@@ -322,13 +520,16 @@ def train(args):
             accelerator,
             epoch,
             loss_scaler,
-            log_writer=log_writer,
+            log_writer=logger,
             args=args,
+            state_recur_cache=state_recur_cache,
         )
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     printer.info("Training time {}".format(total_time_str))
+    if logger is not None:
+        logger.close()
 
     save_final_model(accelerator, args, args.epochs, model, best_so_far=best_so_far)
 
@@ -367,6 +568,124 @@ def build_dataset(dataset, batch_size, num_workers, accelerator, test=False, fix
     return loader
 
 
+def get_batch_sequence_keys(batch):
+    if not batch:
+        return []
+    ref_view = batch[0]
+    labels = ref_view.get("label")
+    datasets = ref_view.get("dataset")
+    instances = ref_view.get("instance")
+
+    if isinstance(labels, (list, tuple)):
+        batch_size = len(labels)
+    elif isinstance(datasets, (list, tuple)):
+        batch_size = len(datasets)
+    elif isinstance(instances, (list, tuple)):
+        batch_size = len(instances)
+    else:
+        batch_size = 1
+
+    def _select(value, index):
+        if isinstance(value, (list, tuple)):
+            return value[index]
+        return value
+
+    keys = []
+    for index in range(batch_size):
+        dataset = _select(datasets, index) if datasets is not None else "unknown"
+        label = _select(labels, index) if labels is not None else _select(instances, index)
+        keys.append(f"{dataset}::{label}")
+    return keys
+
+
+def build_state_recur_override(batch, state_cache, prob):
+    keys = get_batch_sequence_keys(batch)
+    if not state_cache or prob <= 0.0 or not keys:
+        return None, None, keys
+
+    template = next((state_cache[key] for key in keys if key in state_cache), None)
+    if template is None:
+        return None, None, keys
+
+    zero_state = torch.zeros_like(template)
+    override_states = []
+    override_mask = []
+    for key in keys:
+        use_cached = key in state_cache and random.random() < prob
+        override_mask.append(use_cached)
+        override_states.append(state_cache[key] if use_cached else zero_state)
+
+    if not any(override_mask):
+        return None, None, keys
+
+    return (
+        torch.stack(override_states, dim=0),
+        torch.tensor(override_mask, dtype=torch.bool),
+        keys,
+    )
+
+
+def update_state_recur_cache(state_cache, keys, state_cache_output):
+    if state_cache_output is None or not keys:
+        return
+    for index, key in enumerate(keys):
+        state_cache[key] = state_cache_output[index].clone()
+
+
+def get_bayesian_kl_weight(model: torch.nn.Module) -> float:
+    config = getattr(model, "config", None)
+    if config is not None and hasattr(config, "bayesian_kl_weight"):
+        return float(config.bayesian_kl_weight)
+    if hasattr(model, "bayesian_kl_weight"):
+        return float(model.bayesian_kl_weight)
+    return 0.0
+
+
+def apply_bayesian_regularizer(
+    loss,
+    loss_details,
+    bayesian_stats,
+    kl_weight,
+    configured_kl_weight=None,
+):
+    if loss_details is None:
+        loss_details = {}
+    else:
+        loss_details = dict(loss_details)
+
+    if not bayesian_stats or not bayesian_stats.get("enabled", False):
+        return loss, loss_details
+
+    loss_details["bayes_alpha_mean"] = float(bayesian_stats["alpha_mean"].detach())
+    loss_details["bayes_alpha_var"] = float(bayesian_stats["alpha_var"].detach())
+    loss_details["bayes_alpha_min"] = float(bayesian_stats["alpha_min"].detach())
+    loss_details["bayes_alpha_max"] = float(bayesian_stats["alpha_max"].detach())
+    if "alpha_gamma" in bayesian_stats:
+        loss_details["bayes_gamma_mean"] = float(bayesian_stats["alpha_gamma"].mean().detach())
+    if "omega" in bayesian_stats:
+        loss_details["bayes_omega_sum"] = float(bayesian_stats["omega"].sum().detach())
+
+    if configured_kl_weight is None:
+        configured_kl_weight = kl_weight
+
+    kl_loss = bayesian_stats["kl_loss"]
+    weighted_kl = kl_weight * kl_loss
+    configured_weighted_kl = configured_kl_weight * kl_loss
+    loss_details["task_loss"] = float(loss.detach())
+    loss_details["bayes_kl"] = float(kl_loss.detach())
+    loss_details["bayes_kl_weight"] = kl_weight
+    loss_details["bayes_kl_weighted"] = float(weighted_kl.detach())
+    loss_details["bayes_kl_weight_configured"] = configured_kl_weight
+    loss_details["bayes_kl_weighted_configured"] = float(
+        configured_weighted_kl.detach()
+    )
+
+    if kl_weight <= 0:
+        return loss, loss_details
+
+    return loss + weighted_kl, loss_details
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     criterion: torch.nn.Module,
@@ -377,6 +696,7 @@ def train_one_epoch(
     loss_scaler,
     args,
     log_writer=None,
+    state_recur_cache=None,
 ):
     assert torch.backends.cuda.matmul.allow_tf32 == True
 
@@ -411,10 +731,19 @@ def train_one_epoch(
         data_loader.batch_sampler.batch_sampler.set_epoch(epoch)
 
     optimizer.zero_grad()
+    state_recur_enabled = bool(getattr(args, "state_recur_enabled", False))
+    state_recur_prob = (
+        float(getattr(args, "state_recur_prob", 0.3)) if state_recur_enabled else 0.0
+    )
 
     for data_iter_step, batch in enumerate(
         metric_logger.log_every(data_loader, args.print_freq, accelerator, header)
     ):
+        state_init_override, state_init_mask, state_recur_keys = build_state_recur_override(
+            batch,
+            state_recur_cache if state_recur_cache is not None else {},
+            state_recur_prob,
+        )
         with accelerator.accumulate(model):
             epoch_f = epoch + data_iter_step / len(data_loader)
             step = int(epoch_f * len(data_loader))
@@ -429,6 +758,8 @@ def train_one_epoch(
                     accelerator,
                     symmetrize_batch=False,
                     use_amp=bool(args.amp),
+                    state_init_override=state_init_override,
+                    state_init_mask=state_init_mask,
                 )
             else:
                 result = loss_of_one_batch_tbptt(
@@ -441,8 +772,36 @@ def train_one_epoch(
                     accelerator=accelerator,
                     symmetrize_batch=False,
                     use_amp=bool(args.amp),
+                    state_init_override=state_init_override,
+                    state_init_mask=state_init_mask,
                 )
             loss, loss_details = result["loss"]  # criterion returns two values
+            bayesian_stats = result.get("bayesian")
+            configured_kl_weight = get_bayesian_kl_weight(
+                accelerator.unwrap_model(model)
+            )
+            kl_weight = configured_kl_weight
+            if not result.get("already_backprop", False):
+                loss, loss_details = apply_bayesian_regularizer(
+                    loss,
+                    loss_details,
+                    bayesian_stats,
+                    kl_weight,
+                    configured_kl_weight=configured_kl_weight,
+                )
+            elif bayesian_stats and bayesian_stats.get("enabled", False):
+                _, loss_details = apply_bayesian_regularizer(
+                    torch.as_tensor(loss, device=accelerator.device),
+                    loss_details,
+                    bayesian_stats,
+                    0.0,
+                    configured_kl_weight=configured_kl_weight,
+                )
+            update_state_recur_cache(
+                state_recur_cache if state_recur_cache is not None else {},
+                state_recur_keys,
+                result.get("state_cache_output"),
+            )
 
             loss_value = float(loss)
 
@@ -493,16 +852,16 @@ def train_one_epoch(
                 This calibrates different curves when batch size changes.
                 """
                 epoch_1000x = int(epoch_f * 1000)
-                log_writer.add_scalar("train_loss", loss_value_reduce, step)
-                log_writer.add_scalar("train_lr", lr, step)
-                log_writer.add_scalar("train_iter", epoch_1000x, step)
+                log_writer.add_scalar(join_metric_path("train", "loss"), loss_value_reduce, step)
+                log_writer.add_scalar(join_metric_path("train", "lr"), lr, step)
+                log_writer.add_scalar(join_metric_path("train", "iter_epoch_x1000"), epoch_1000x, step)
                 for name, val in loss_details.items():
                     if isinstance(val, torch.Tensor):
                         if val.ndim > 0:
                             continue
                     if isinstance(val, dict):
                         continue
-                    log_writer.add_scalar("train_" + name, val, step)
+                    log_writer.add_scalar(join_metric_path("train", name), val, step)
 
             if tb_vis_img:
                 if log_writer is None:
@@ -533,12 +892,16 @@ def train_one_epoch(
                 )
                 for name, imgs_stacked in imgs_stacked_dict.items():
                     log_writer.add_images(
-                        "train" + "/" + name, imgs_stacked, step, dataformats="HWC"
+                        join_metric_path("train", name), imgs_stacked, step, dataformats="HWC"
                     )
                 del batch
 
+        save_every_steps = (
+            int(args.save_freq * len(data_loader)) if args.save_freq else 0
+        )
         if (
-            data_iter_step % int(args.save_freq * len(data_loader)) == 0
+            save_every_steps > 0
+            and data_iter_step % save_every_steps == 0
             and data_iter_step != 0
             and data_iter_step != len(data_loader) - 1
         ):
@@ -562,6 +925,7 @@ def test_one_epoch(
     args,
     log_writer=None,
     prefix="test",
+    global_step=None,
 ):
 
     model.eval()
@@ -594,6 +958,17 @@ def test_one_epoch(
         )
 
         loss_value, loss_details = result["loss"]  # criterion returns two values
+        bayesian_stats = result.get("bayesian")
+        configured_kl_weight = get_bayesian_kl_weight(accelerator.unwrap_model(model))
+        _, loss_details = apply_bayesian_regularizer(
+            loss_value
+            if isinstance(loss_value, torch.Tensor)
+            else torch.as_tensor(loss_value, device=device),
+            loss_details,
+            bayesian_stats,
+            0.0,
+            configured_kl_weight=configured_kl_weight,
+        )
         metric_logger.update(loss=float(loss_value), **loss_details)
 
     printer.info("Averaged stats: %s", metric_logger)
@@ -606,13 +981,16 @@ def test_one_epoch(
     }
 
     if log_writer is not None:
+        metric_prefix = join_metric_path("test", prefix)
+        if global_step is None:
+            global_step = epoch
         for name, val in results.items():
             if isinstance(val, torch.Tensor):
                 if val.ndim > 0:
                     continue
             if isinstance(val, dict):
                 continue
-            log_writer.add_scalar(prefix + "_" + name, val, 1000 * epoch)
+            log_writer.add_scalar(join_metric_path(metric_prefix, name), val, global_step)
 
         depths_self, gt_depths_self = get_render_results(
             batch, result["pred"], self_view=True
@@ -634,7 +1012,7 @@ def test_one_epoch(
         )
         for name, imgs_stacked in imgs_stacked_dict.items():
             log_writer.add_images(
-                prefix + "/" + name, imgs_stacked, 1000 * epoch, dataformats="HWC"
+                join_metric_path(metric_prefix, name), imgs_stacked, global_step, dataformats="HWC"
             )
 
     del loss_details, loss_value, batch
@@ -728,6 +1106,8 @@ def vis_and_cat(
         ),
         append_cbar=True,
     )
+    cross_conf_vis = torch.zeros_like(cross_gt_depths_vis)
+    self_conf_vis = torch.zeros_like(cross_gt_depths_vis)
     if len(cross_conf) > 0:
         cross_conf_vis = colorize(cross_conf, append_cbar=True)
     if len(self_conf) > 0:
@@ -792,23 +1172,31 @@ def get_vis_imgs_new(loss_details, num_imgs_vis, num_views, is_metric):
     else:
         stride = 1
     for i in range(0, num_views, stride):
-        gt_imgs = 0.5 * (loss_details[f"gt_img{i+1}"] + 1)[:num_imgs_vis].detach().cpu()
-        width = gt_imgs.shape[2]
-        pred_imgs = (
-            0.5 * (loss_details[f"pred_rgb_{i+1}"] + 1)[:num_imgs_vis].detach().cpu()
-        )
-        gt_img_list = batch_append(gt_img_list, gt_imgs.unbind(dim=0))
-        pred_img_list = batch_append(pred_img_list, pred_imgs.unbind(dim=0))
-
         cross_pred_depths = (
             loss_details[f"pred_depth_{i+1}"][:num_imgs_vis].detach().cpu()
         )
         cross_gt_depths = (
-            loss_details[f"gt_depth_{i+1}"]
-            .to(gt_imgs.device)[:num_imgs_vis]
-            .detach()
-            .cpu()
+            loss_details[f"gt_depth_{i+1}"][:num_imgs_vis].detach().cpu()
         )
+        rgb_shape = (*cross_pred_depths.shape, 3)
+        gt_img_key = f"gt_img{i+1}"
+        pred_img_key = f"pred_rgb_{i+1}"
+        if gt_img_key in loss_details:
+            gt_imgs = (
+                0.5 * (loss_details[gt_img_key] + 1)[:num_imgs_vis].detach().cpu()
+            )
+        else:
+            gt_imgs = torch.zeros(rgb_shape, dtype=torch.float32)
+        width = gt_imgs.shape[2]
+        if pred_img_key in loss_details:
+            pred_imgs = (
+                0.5 * (loss_details[pred_img_key] + 1)[:num_imgs_vis].detach().cpu()
+            )
+        else:
+            pred_imgs = torch.zeros_like(gt_imgs)
+        gt_img_list = batch_append(gt_img_list, gt_imgs.unbind(dim=0))
+        pred_img_list = batch_append(pred_img_list, pred_imgs.unbind(dim=0))
+
         cross_pred_depth_list = batch_append(
             cross_pred_depth_list, cross_pred_depths.unbind(dim=0)
         )
@@ -854,36 +1242,48 @@ def get_vis_imgs_new(loss_details, num_imgs_vis, num_views, is_metric):
             loss_details[f"ray_mask_{i+1}"][:num_imgs_vis].detach().cpu().unbind(dim=0),
         )
 
-    # each element in the list is [H, num_views * W, (3)], the size of the list is num_imgs_vis
-    gt_img_list = [torch.cat(sublist, dim=1) for sublist in gt_img_list]
-    pred_img_list = [torch.cat(sublist, dim=1) for sublist in pred_img_list]
+    valid_indices = [idx for idx, sublist in enumerate(gt_img_list) if len(sublist) > 0]
+    if not valid_indices:
+        return ret_dict
+
+    # each element in the list is [H, num_views * W, (3)], the size of the list is the number of valid images
+    gt_img_list = [torch.cat(gt_img_list[idx], dim=1) for idx in valid_indices]
+    pred_img_list = [torch.cat(pred_img_list[idx], dim=1) for idx in valid_indices]
     cross_pred_depth_list = [
-        torch.cat(sublist, dim=1) for sublist in cross_pred_depth_list
+        torch.cat(cross_pred_depth_list[idx], dim=1) for idx in valid_indices
     ]
-    cross_gt_depth_list = [torch.cat(sublist, dim=1) for sublist in cross_gt_depth_list]
-    self_gt_depth_list = [torch.cat(sublist, dim=1) for sublist in self_gt_depth_list]
+    cross_gt_depth_list = [
+        torch.cat(cross_gt_depth_list[idx], dim=1) for idx in valid_indices
+    ]
+    self_gt_depth_list = [
+        torch.cat(self_gt_depth_list[idx], dim=1) for idx in valid_indices
+    ]
     self_pred_depth_list = [
-        torch.cat(sublist, dim=1) for sublist in self_pred_depth_list
+        torch.cat(self_pred_depth_list[idx], dim=1) for idx in valid_indices
     ]
-    cross_view_conf_list = (
-        [torch.cat(sublist, dim=1) for sublist in cross_view_conf_list]
-        if cross_view_conf_exits
-        else []
-    )
-    self_view_conf_list = (
-        [torch.cat(sublist, dim=1) for sublist in self_view_conf_list]
-        if self_view_conf_exits
-        else []
-    )
-    # each elment in the list is [num_views,], the size of the list is num_imgs_vis
-    img_mask_list = [torch.stack(sublist, dim=0) for sublist in img_mask_list]
-    ray_mask_list = [torch.stack(sublist, dim=0) for sublist in ray_mask_list]
+    if cross_view_conf_exits:
+        cross_view_conf_list = [
+            torch.cat(cross_view_conf_list[idx], dim=1) if len(cross_view_conf_list[idx]) > 0 else []
+            for idx in valid_indices
+        ]
+    else:
+        cross_view_conf_list = [[] for _ in valid_indices]
+    if self_view_conf_exits:
+        self_view_conf_list = [
+            torch.cat(self_view_conf_list[idx], dim=1) if len(self_view_conf_list[idx]) > 0 else []
+            for idx in valid_indices
+        ]
+    else:
+        self_view_conf_list = [[] for _ in valid_indices]
+    # each element in the list is [num_views,], the size of the list is the number of valid images
+    img_mask_list = [torch.stack(img_mask_list[idx], dim=0) for idx in valid_indices]
+    ray_mask_list = [torch.stack(ray_mask_list[idx], dim=0) for idx in valid_indices]
 
     ray_indicator = gen_mask_indicator(
         img_mask_list, ray_mask_list, len(img_mask_list[0]), 30, width
     )
 
-    for i in range(num_imgs_vis):
+    for i in range(len(valid_indices)):
         out = vis_and_cat(
             gt_img_list[i],
             pred_img_list[i],

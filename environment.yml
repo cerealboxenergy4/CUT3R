@@ -1,4 +1,4 @@
-name: cut3r_124  # 가상환경 이름
+name: bayes_cut3r
 channels:
   - pytorch
   - nvidia
@@ -6,13 +6,10 @@ channels:
   - defaults
 dependencies:
   - python=3.10
-  - pytorch
+  - pytorch=2.4.*
   - torchvision
   - torchaudio
   - pytorch-cuda=12.4
-  - cuda-version=12.4        # 1. 13.2 방어막 설치
-  - cuda-toolkit=12.4  # nvcc 12.4 포함
-  - cuda-nvcc=12.4.131      # 3. nvcc 버전 직접 지정
   - numpy=1.26.4
   - pillow=10.3.0
   - scipy
@@ -22,6 +19,11 @@ dependencies:
   - h5py
   - pip
   - pip:
+      - --extra-index-url https://docs.gsplat.studio/whl/pt24cu124
+      - gsplat
+      - ninja
+      - jaxtyping
+      - rich
       - roma
       - gradio
       - einops
@@ -34,4 +36,4 @@ dependencies:
       - hydra-core
       - accelerate
       - transformers
-      - opencv-python  # conda보다 pip 버전이 서버에서 덜 꼬임
+      - opencv-python

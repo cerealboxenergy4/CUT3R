@@ -64,3 +64,6 @@ src/checkpoints
 experiments/
 demo_tmp/
 tmp/
+
+# Codex related 
+AGENTS.md

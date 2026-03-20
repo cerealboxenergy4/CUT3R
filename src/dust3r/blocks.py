@@ -6,9 +6,11 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from itertools import repeat
 import collections.abc
+import math
 from torch.nn.functional import scaled_dot_product_attention
 from functools import partial
 
@@ -56,6 +58,111 @@ class DropPath(nn.Module):
         return f"drop_prob={round(self.drop_prob,3):0.3f}"
 
 
+def _select_alpha(alpha, key):
+    if isinstance(alpha, dict):
+        return alpha.get(key)
+    if torch.is_tensor(alpha) and alpha.ndim >= 2 and alpha.shape[-2] == 3:
+        index = {"attn": 0, "cross_attn": 1, "mlp": 2}.get(key)
+        if index is not None:
+            return alpha.select(dim=-2, index=index)
+    return alpha
+
+
+class BayesianLinear(nn.Linear):
+    def __init__(self, *args, sigma=1e-3, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sigma = float(sigma)
+        self.lora_rank = 0
+        self.lora_alpha = 0.0
+        self.lora_scaling = 0.0
+        self.lora_A = None
+        self.lora_B = None
+        self.lora_dropout = nn.Identity()
+
+    def enable_lora(self, rank, alpha, dropout=0.0):
+        rank = int(rank)
+        if rank <= 0:
+            return
+        if self.lora_A is not None and self.lora_B is not None:
+            return
+        self.lora_rank = rank
+        self.lora_alpha = float(alpha)
+        self.lora_scaling = self.lora_alpha / self.lora_rank
+        self.lora_A = nn.Parameter(
+            torch.empty(rank, self.in_features, device=self.weight.device, dtype=self.weight.dtype)
+        )
+        self.lora_B = nn.Parameter(
+            torch.zeros(self.out_features, rank, device=self.weight.device, dtype=self.weight.dtype)
+        )
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+        self.lora_dropout = nn.Dropout(float(dropout)) if dropout > 0 else nn.Identity()
+
+    def has_lora(self):
+        return self.lora_A is not None and self.lora_B is not None
+
+    def lora_parameters(self):
+        params = []
+        if self.lora_A is not None:
+            params.append(self.lora_A)
+        if self.lora_B is not None:
+            params.append(self.lora_B)
+        return params
+
+    def _lora_delta_weight(self):
+        if not self.has_lora():
+            return None
+        return (self.lora_B @ self.lora_A) * self.lora_scaling
+
+    def _effective_weight(self):
+        delta = self._lora_delta_weight()
+        if delta is None:
+            return self.weight
+        return self.weight + delta.to(dtype=self.weight.dtype, device=self.weight.device)
+
+    def _match_alpha_shape(self, alpha, weight_mean):
+        alpha = torch.as_tensor(alpha, dtype=weight_mean.dtype, device=weight_mean.device)
+        alpha = torch.clamp_min(alpha, 0.0)
+        if alpha.shape[-1] != weight_mean.shape[-1]:
+            if weight_mean.shape[-1] % alpha.shape[-1] != 0:
+                raise ValueError(
+                    f"Cannot broadcast alpha with last dim {alpha.shape[-1]} "
+                    f"to output dim {weight_mean.shape[-1]}"
+                )
+            repeat_factor = weight_mean.shape[-1] // alpha.shape[-1]
+            alpha = alpha.repeat_interleave(repeat_factor, dim=-1)
+        while alpha.ndim < weight_mean.ndim:
+            alpha = alpha.unsqueeze(1)
+        return alpha
+
+    def forward(self, input, alpha=None, sample=None):
+        weight = self._effective_weight()
+        lora_input = self.lora_dropout(input) if self.has_lora() else input
+        if self.has_lora():
+            weight_mean = F.linear(input, self.weight, None) + F.linear(
+                lora_input, self._lora_delta_weight().to(dtype=input.dtype, device=input.device), None
+            )
+        else:
+            weight_mean = F.linear(input, weight, None)
+        if alpha is None:
+            return weight_mean if self.bias is None else weight_mean + self.bias
+
+        sample = self.training if sample is None else sample
+        alpha = self._match_alpha_shape(alpha, weight_mean)
+
+        mean = weight_mean * alpha
+        if self.bias is not None:
+            mean = mean + self.bias
+
+        if not sample:
+            return mean
+
+        variance = F.linear(input.square(), weight.square(), None)
+        variance = variance * alpha.square() * (self.sigma ** 2)
+        noise = torch.randn_like(mean)
+        return mean + noise * torch.sqrt(torch.clamp_min(variance, 1e-8))
+
+
 class Mlp(nn.Module):
     """MLP as used in Vision Transformer, MLP-Mixer and related networks"""
 
@@ -74,14 +181,18 @@ class Mlp(nn.Module):
         bias = to_2tuple(bias)
         drop_probs = to_2tuple(drop)
 
-        self.fc1 = nn.Linear(in_features, hidden_features, bias=bias[0])
+        self.fc1 = BayesianLinear(in_features, hidden_features, bias=bias[0])
         self.act = act_layer()
         self.drop1 = nn.Dropout(drop_probs[0])
-        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias[1])
+        self.fc2 = BayesianLinear(hidden_features, out_features, bias=bias[1])
         self.drop2 = nn.Dropout(drop_probs[1])
 
-    def forward(self, x):
-        return self.drop2(self.fc2(self.drop1(self.act(self.fc1(x)))))
+    def forward(self, x, alpha=None, sample=None):
+        x = self.fc1(x, alpha=alpha, sample=sample)
+        x = self.act(x)
+        x = self.drop1(x)
+        x = self.fc2(x, alpha=alpha, sample=sample)
+        return self.drop2(x)
 
 
 class Attention(nn.Module):
@@ -93,9 +204,9 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = head_dim**-0.5
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.qkv = BayesianLinear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
+        self.proj = BayesianLinear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope.float() if rope is not None else None
 
@@ -103,11 +214,11 @@ class Attention(nn.Module):
         self.collect_attention = False
         self.last_alpha = None
 
-    def forward(self, x, xpos):
+    def forward(self, x, xpos, alpha=None, sample=None):
         B, N, C = x.shape
 
         qkv = (
-            self.qkv(x)
+            self.qkv(x, alpha=alpha, sample=sample)
             .reshape(B, N, 3, self.num_heads, C // self.num_heads)
             .transpose(1, 3)
         )
@@ -141,7 +252,7 @@ class Attention(nn.Module):
                 .reshape(B, N, C)
             )
 
-        x = self.proj(x)
+        x = self.proj(x, alpha=alpha, sample=sample)
         x = self.proj_drop(x)
         return x
 
@@ -182,9 +293,13 @@ class Block(nn.Module):
             drop=drop,
         )
 
-    def forward(self, x, xpos):
-        x = x + self.drop_path(self.attn(self.norm1(x), xpos))
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+    def forward(self, x, xpos, alpha=None, sample=None):
+        attn_alpha = _select_alpha(alpha, "attn")
+        mlp_alpha = _select_alpha(alpha, "mlp")
+        x = x + self.drop_path(
+            self.attn(self.norm1(x), xpos, alpha=attn_alpha, sample=sample)
+        )
+        x = x + self.drop_path(self.mlp(self.norm2(x), alpha=mlp_alpha, sample=sample))
         return x
 
 
@@ -198,11 +313,11 @@ class CrossAttention(nn.Module):
         head_dim = dim // num_heads
         self.scale = head_dim**-0.5
 
-        self.projq = nn.Linear(dim, dim, bias=qkv_bias)
-        self.projk = nn.Linear(dim, dim, bias=qkv_bias)
-        self.projv = nn.Linear(dim, dim, bias=qkv_bias)
+        self.projq = BayesianLinear(dim, dim, bias=qkv_bias)
+        self.projk = BayesianLinear(dim, dim, bias=qkv_bias)
+        self.projv = BayesianLinear(dim, dim, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
+        self.proj = BayesianLinear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
         self.rope = rope.float() if rope is not None else None
@@ -211,23 +326,23 @@ class CrossAttention(nn.Module):
         self.collect_attention = False
         self.last_alpha = None
 
-    def forward(self, query, key, value, qpos, kpos):
+    def forward(self, query, key, value, qpos, kpos, alpha=None, sample=None):
         B, Nq, C = query.shape
         Nk = key.shape[1]
         Nv = value.shape[1]
 
         q = (
-            self.projq(query)
+            self.projq(query, alpha=alpha, sample=sample)
             .reshape(B, Nq, self.num_heads, C // self.num_heads)
             .permute(0, 2, 1, 3)
         )
         k = (
-            self.projk(key)
+            self.projk(key, alpha=alpha, sample=sample)
             .reshape(B, Nk, self.num_heads, C // self.num_heads)
             .permute(0, 2, 1, 3)
         )
         v = (
-            self.projv(value)
+            self.projv(value, alpha=alpha, sample=sample)
             .reshape(B, Nv, self.num_heads, C // self.num_heads)
             .permute(0, 2, 1, 3)
         )
@@ -266,7 +381,7 @@ class CrossAttention(nn.Module):
                 .reshape(B, Nq, C)
             )
 
-        x = self.proj(x)
+        x = self.proj(x, alpha=alpha, sample=sample)
         x = self.proj_drop(x)
         return x
 
@@ -317,11 +432,20 @@ class DecoderBlock(nn.Module):
         )
         self.norm_y = norm_layer(dim) if norm_mem else nn.Identity()
 
-    def forward(self, x, y, xpos, ypos):
-        x = x + self.drop_path(self.attn(self.norm1(x), xpos))
+    def forward(self, x, y, xpos, ypos, alpha=None, sample=None):
+        attn_alpha = _select_alpha(alpha, "attn")
+        cross_alpha = _select_alpha(alpha, "cross_attn")
+        mlp_alpha = _select_alpha(alpha, "mlp")
+        x = x + self.drop_path(
+            self.attn(self.norm1(x), xpos, alpha=attn_alpha, sample=sample)
+        )
         y_ = self.norm_y(y)
-        x = x + self.drop_path(self.cross_attn(self.norm2(x), y_, y_, xpos, ypos))
-        x = x + self.drop_path(self.mlp(self.norm3(x)))
+        x = x + self.drop_path(
+            self.cross_attn(
+                self.norm2(x), y_, y_, xpos, ypos, alpha=cross_alpha, sample=sample
+            )
+        )
+        x = x + self.drop_path(self.mlp(self.norm3(x), alpha=mlp_alpha, sample=sample))
         return x, y
 
     
@@ -372,12 +496,21 @@ class CustomDecoderBlock(nn.Module):
         self.norm_y = norm_layer(dim) if norm_mem else nn.Identity()
         self.norm_z = norm_layer(dim) if norm_mem else nn.Identity()
 
-    def forward(self, x, y, z, xpos, ypos):
-        x = x + self.drop_path(self.attn(self.norm1(x), xpos))
+    def forward(self, x, y, z, xpos, ypos, alpha=None, sample=None):
+        attn_alpha = _select_alpha(alpha, "attn")
+        cross_alpha = _select_alpha(alpha, "cross_attn")
+        mlp_alpha = _select_alpha(alpha, "mlp")
+        x = x + self.drop_path(
+            self.attn(self.norm1(x), xpos, alpha=attn_alpha, sample=sample)
+        )
         y_ = self.norm_y(y)
         z_ = self.norm_z(z)
-        x = x + self.drop_path(self.cross_attn(self.norm2(x), y_, z_, xpos, ypos))
-        x = x + self.drop_path(self.mlp(self.norm3(x)))
+        x = x + self.drop_path(
+            self.cross_attn(
+                self.norm2(x), y_, z_, xpos, ypos, alpha=cross_alpha, sample=sample
+            )
+        )
+        x = x + self.drop_path(self.mlp(self.norm3(x), alpha=mlp_alpha, sample=sample))
         return x, y
 
 
@@ -442,9 +575,13 @@ class ConditionModulationBlock(nn.Module):
             drop=drop,
         )
 
-    def forward(self, x, mod, xpos):
-        x = x + self.drop_path(self.attn(self.norm1(x, mod), xpos))
-        x = x + self.drop_path(self.mlp(self.norm2(x, mod)))
+    def forward(self, x, mod, xpos, alpha=None, sample=None):
+        attn_alpha = _select_alpha(alpha, "attn")
+        mlp_alpha = _select_alpha(alpha, "mlp")
+        x = x + self.drop_path(
+            self.attn(self.norm1(x, mod), xpos, alpha=attn_alpha, sample=sample)
+        )
+        x = x + self.drop_path(self.mlp(self.norm2(x, mod), alpha=mlp_alpha, sample=sample))
         return x
 
 

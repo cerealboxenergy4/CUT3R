@@ -80,6 +80,20 @@ class MSELoss(LLoss):
 MSE = MSELoss()
 
 
+def _mean_or_zero(value):
+    if value.numel() == 0:
+        return value.new_zeros(())
+    return value.mean()
+
+
+def _detail_scalar(value):
+    scalar = _mean_or_zero(value) if isinstance(value, torch.Tensor) else value
+    if isinstance(scalar, torch.Tensor):
+        scalar = torch.nan_to_num(scalar.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+        return float(scalar)
+    return float(scalar)
+
+
 class Criterion(nn.Module):
     def __init__(self, criterion=None):
         super().__init__()
@@ -240,9 +254,15 @@ class DepthScaleShiftInvLoss(BaseCriterion):
         x_valid = x[mask]
         splits = mask.sum(dim=(1, 2)).tolist()
         x_valid_list = torch.split(x_valid, splits)
-        shift = [x.mean() for x in x_valid_list]
-        x_valid_centered = [x - m for x, m in zip(x_valid_list, shift)]
-        scale = [x.abs().mean() for x in x_valid_centered]
+        shift = [
+            sample.mean() if sample.numel() > 0 else x.new_zeros(())
+            for sample in x_valid_list
+        ]
+        x_valid_centered = [sample - mean for sample, mean in zip(x_valid_list, shift)]
+        scale = [
+            sample.abs().mean() if sample.numel() > 0 else x.new_ones(())
+            for sample in x_valid_centered
+        ]
         scale = torch.stack(scale)
         shift = torch.stack(shift)
         x = (x - shift.view(-1, 1, 1)) / scale.view(-1, 1, 1).clamp(min=1e-6)
@@ -488,8 +508,8 @@ class Regr3DPose(Criterion, MultiLoss):
         pr_poses = [
             (pr[:, :3] / pose_norm_factor_pr.clip(eps), pr[:, 3:]) for pr in pr_poses
         ]
-        pose_masks = (pose_norm_factor_gt.squeeze() > eps) & (
-            pose_norm_factor_pr.squeeze() > eps
+        pose_masks = (pose_norm_factor_gt.reshape(-1) > eps) & (
+            pose_norm_factor_pr.reshape(-1) > eps
         )
 
         if any(camera_only):
@@ -656,8 +676,8 @@ class Regr3DPose(Criterion, MultiLoss):
             (pr[:, :3] / pose_norm_factor_pr.clip(eps), pr[:, 3:]) for pr in pr_poses
         ]
 
-        pose_masks = (pose_norm_factor_gt.squeeze() > eps) & (
-            pose_norm_factor_pr.squeeze() > eps
+        pose_masks = (pose_norm_factor_gt.reshape(-1) > eps) & (
+            pose_norm_factor_pr.reshape(-1) > eps
         )
 
         if any(camera_only):
@@ -738,24 +758,39 @@ class Regr3DPose(Criterion, MultiLoss):
         """
         gt_pose: list of (Bx3, Bx4)
         pred_pose: list of (Bx3, Bx4)
-        masks: None, or B
+        masks: None, B, or BxN
         """
         gt_trans = torch.stack([gt[0] for gt in gt_poses], dim=1)  # BxNx3
         gt_quats = torch.stack([gt[1] for gt in gt_poses], dim=1)  # BXNX3
         pred_trans = torch.stack([pr[0] for pr in pred_poses], dim=1)  # BxNx4
         pred_quats = torch.stack([pr[1] for pr in pred_poses], dim=1)  # BxNx4
-        if masks == None:
+        if masks is None:
             pose_loss = (
                 torch.norm(pred_trans - gt_trans, dim=-1).mean()
                 + torch.norm(pred_quats - gt_quats, dim=-1).mean()
             )
         else:
-            if not any(masks):
-                return torch.tensor(0.0)
-            pose_loss = (
-                torch.norm(pred_trans - gt_trans, dim=-1)[masks].mean()
-                + torch.norm(pred_quats - gt_quats, dim=-1)[masks].mean()
-            )
+            if torch.is_tensor(masks) and masks.ndim == 0:
+                if not bool(masks.item()):
+                    return pred_trans.new_zeros(())
+                masks = None
+            elif torch.is_tensor(masks):
+                if masks.ndim == 1 and not bool(masks.any()):
+                    return pred_trans.new_zeros(())
+                if masks.ndim == 2 and not bool(masks.any()):
+                    return pred_trans.new_zeros(())
+            elif not any(masks):
+                return pred_trans.new_zeros(())
+
+            if masks is None:
+                pose_loss = (
+                    torch.norm(pred_trans - gt_trans, dim=-1).mean()
+                    + torch.norm(pred_quats - gt_quats, dim=-1).mean()
+                )
+            else:
+                trans_err = torch.norm(pred_trans - gt_trans, dim=-1)
+                quat_err = torch.norm(pred_quats - gt_quats, dim=-1)
+                pose_loss = trans_err[masks].mean() + quat_err[masks].mean()
 
         return pose_loss
 
@@ -802,7 +837,7 @@ class Regr3DPose(Criterion, MultiLoss):
 
         details = {}
         for i in range(len(ls_self)):
-            details[self_name + f"_self_pts3d/{i+1}"] = float(ls_self[i].mean())
+            details[self_name + f"_self_pts3d/{i+1}"] = _detail_scalar(ls_self[i])
             details[f"gt_img{i+1}"] = gts[i]["img"].permute(0, 2, 3, 1).detach()
             details[f"self_conf_{i+1}"] = preds[i]["conf_self"].detach()
             details[f"valid_mask_{i+1}"] = masks[i].detach()
@@ -844,9 +879,7 @@ class Regr3DPose(Criterion, MultiLoss):
                 )
 
         for i in range(len(ls_cross)):
-            details[self_name + f"_pts3d/{i+1}"] = float(
-                ls_cross[i].mean() if ls_cross[i].numel() > 0 else 0
-            )
+            details[self_name + f"_pts3d/{i+1}"] = _detail_scalar(ls_cross[i])
             details[f"conf_{i+1}"] = preds[i]["conf"].detach()
 
         ls = ls_self + ls_cross
@@ -967,7 +1000,7 @@ class Regr3DPoseBatchList(Regr3DPose):
 
         details = {}
         for i in range(len(ls_self)):
-            details[self_name + f"_self_pts3d/{i+1}"] = float(ls_self[i].mean())
+            details[self_name + f"_self_pts3d/{i+1}"] = _detail_scalar(ls_self[i])
             details[f"self_conf_{i+1}"] = preds[i]["conf_self"].detach()
             details[f"gt_img{i+1}"] = gts[i]["img"].permute(0, 2, 3, 1).detach()
             details[f"valid_mask_{i+1}"] = masks[i].detach()
@@ -1027,9 +1060,7 @@ class Regr3DPoseBatchList(Regr3DPose):
                 )
 
         for i in range(len(ls_cross)):
-            details[self_name + f"_pts3d/{i+1}"] = float(
-                ls_cross[i].mean() if ls_cross[i].numel() > 0 else 0
-            )
+            details[self_name + f"_pts3d/{i+1}"] = _detail_scalar(ls_cross[i])
             details[f"conf_{i+1}"] = preds[i]["conf"].detach()
 
         ls = ls_self + ls_cross
@@ -1038,7 +1069,8 @@ class Regr3DPoseBatchList(Regr3DPose):
         details["img_ids"] = (
             np.arange(len(ls_self)).tolist() + np.arange(len(ls_cross)).tolist()
         )
-        pose_masks = pose_masks * gts[i]["img_mask"]
+        pose_img_mask = torch.stack([gt["img_mask"] for gt in gts], dim=1)
+        pose_masks = pose_masks[:, None] & pose_img_mask
         details["pose_loss"] = self.compute_pose_loss(gt_poses, pr_poses, pose_masks)
 
         return Sum(*list(zip(ls, masks))), (details | monitoring)

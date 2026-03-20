@@ -1,11 +1,22 @@
 import tqdm
 import torch
 from dust3r.utils.device import to_cpu, collate_with_cat
+from dust3r.utils.device import to_device
 from dust3r.utils.misc import invalid_to_nans
 from dust3r.utils.geometry import depthmap_to_pts3d, geotrf
 from dust3r.model import ARCroco3DStereo
 from accelerate import Accelerator
 import re
+
+
+def _unwrap_model(model, accelerator):
+    if accelerator is not None:
+        return accelerator.unwrap_model(model)
+    return model
+
+
+def _cuda_bf16_autocast(enabled):
+    return torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=enabled)
 
 
 def custom_sort_key(key):
@@ -64,6 +75,8 @@ def loss_of_one_batch(
     inference=False,
     collect=False,
     skip_state=False,
+    state_init_override=None,
+    state_init_mask=None,
 ):
     if len(batch) > 2:
         assert (
@@ -71,24 +84,54 @@ def loss_of_one_batch(
         ), "cannot symmetrize batch with more than 2 views"
     if symmetrize_batch:
         batch = make_batch_symmetric(batch)
+    if accelerator is not None:
+        batch = to_device(batch, accelerator.device, non_blocking=True)
+        if state_init_override is not None:
+            state_init_override = state_init_override.to(
+                accelerator.device, non_blocking=True
+            )
+        if state_init_mask is not None:
+            state_init_mask = state_init_mask.to(
+                accelerator.device, non_blocking=True
+            )
 
-    with torch.cuda.amp.autocast(enabled=not inference):
+    autocast_enabled = bool(use_amp) and (not inference) and model.training
+    with _cuda_bf16_autocast(enabled=autocast_enabled):
         if inference:
-            output, state_args = model(batch, ret_state=True, skip_state=skip_state)
+            output, state_args = model(
+                batch,
+                ret_state=True,
+                skip_state=skip_state,
+                state_init_override=state_init_override,
+                state_init_mask=state_init_mask,
+            )
             preds, batch = output.ress, output.views
-            result = dict(views=batch, pred=preds)
+            bayesian = _unwrap_model(model, accelerator).get_bayesian_stats()
+            result = dict(views=batch, pred=preds, bayesian=bayesian)
             if collect:
                 attn_seq = model.attn_dump_seq
                 return result, state_args, attn_seq
             return result[ret] if ret else result, state_args
         else:
-            output = model(batch)
+            output = model(
+                batch,
+                state_init_override=state_init_override,
+                state_init_mask=state_init_mask,
+            )
             preds, batch = output.ress, output.views
 
-        with torch.cuda.amp.autocast(enabled=False):
+        with _cuda_bf16_autocast(enabled=False):
             loss = criterion(batch, preds) if criterion is not None else None
 
-    result = dict(views=batch, pred=preds, loss=loss)
+    bayesian = _unwrap_model(model, accelerator).get_bayesian_stats()
+    state_cache_output = _unwrap_model(model, accelerator).pop_state_cache_output()
+    result = dict(
+        views=batch,
+        pred=preds,
+        loss=loss,
+        bayesian=bayesian,
+        state_cache_output=state_cache_output,
+    )
     return result[ret] if ret else result
 
 
@@ -106,6 +149,8 @@ def loss_of_one_batch_tbptt(
     ret=None,
     img_mask=None,
     inference=False,
+    state_init_override=None,
+    state_init_mask=None,
 ):
     if len(batch) > 2:
         assert (
@@ -113,10 +158,21 @@ def loss_of_one_batch_tbptt(
         ), "cannot symmetrize batch with more than 2 views"
     if symmetrize_batch:
         batch = make_batch_symmetric(batch)
+    if accelerator is not None:
+        batch = to_device(batch, accelerator.device, non_blocking=True)
+        if state_init_override is not None:
+            state_init_override = state_init_override.to(
+                accelerator.device, non_blocking=True
+            )
+        if state_init_mask is not None:
+            state_init_mask = state_init_mask.to(
+                accelerator.device, non_blocking=True
+            )
     all_preds = []
     all_loss = 0.0
     all_loss_details = {}
-    with torch.cuda.amp.autocast(enabled=not inference):
+    autocast_enabled = bool(use_amp) and (not inference) and model.training
+    with _cuda_bf16_autocast(enabled=autocast_enabled):
         with torch.no_grad():
             (feat, pos, shape), (
                 init_state_feat,
@@ -124,7 +180,11 @@ def loss_of_one_batch_tbptt(
                 state_feat,
                 state_pos,
                 mem,
-            ) = accelerator.unwrap_model(model)._forward_encoder(batch)
+            ) = accelerator.unwrap_model(model)._forward_encoder(
+                batch,
+                state_init_override=state_init_override,
+                state_init_mask=state_init_mask,
+            )
         feat = [f.detach() for f in feat]
         pos = [p.detach() for p in pos]
         shape = [s.detach() for s in shape]
@@ -160,7 +220,7 @@ def loss_of_one_batch_tbptt(
                         preds.append(res)
                         all_preds.append({k: v.detach() for k, v in res.items()})
                         chunk.append(batch[i])
-                with torch.cuda.amp.autocast(enabled=False):
+                with _cuda_bf16_autocast(enabled=False):
                     loss, loss_details = (
                         criterion(chunk, preds, camera1=batch[0]["camera_pose"])
                         if criterion is not None
@@ -193,7 +253,7 @@ def loss_of_one_batch_tbptt(
                     preds.append(res)
                     all_preds.append({k: v.detach() for k, v in res.items()})
                     chunk.append(batch[i])
-                with torch.cuda.amp.autocast(enabled=False):
+                with _cuda_bf16_autocast(enabled=False):
                     loss, loss_details = (
                         criterion(chunk, preds, camera1=batch[0]["camera_pose"])
                         if criterion is not None
@@ -216,6 +276,8 @@ def loss_of_one_batch_tbptt(
         views=batch,
         pred=all_preds,
         loss=(all_loss / ((len(batch) - 1) // chunk_size + 1), all_loss_details),
+        bayesian=_unwrap_model(model, accelerator).get_bayesian_stats(),
+        state_cache_output=state_feat.detach().to(device="cpu", dtype=torch.float16),
         already_backprop=True,
     )
     return result[ret] if ret else result

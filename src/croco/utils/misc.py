@@ -104,6 +104,8 @@ class MetricLogger(object):
             if isinstance(v, list):
                 continue
             assert isinstance(v, (float, int))
+            if not math.isfinite(v):
+                continue
             self.meters[k].update(v)
 
     def __getattr__(self, attr):
@@ -571,7 +573,15 @@ def get_parameter_groups(
 
         parameter_group_vars[group_name]["params"].append(param)
         parameter_group_names[group_name]["params"].append(name)
-    printer.info("Param groups = %s" % json.dumps(parameter_group_names, indent=2))
+    parameter_group_summary = {
+        group_name: {
+            "weight_decay": group_config["weight_decay"],
+            "num_tensors": len(group_config["params"]),
+            "lr_scale": group_config["lr_scale"],
+        }
+        for group_name, group_config in parameter_group_names.items()
+    }
+    printer.info("Param groups summary = %s" % json.dumps(parameter_group_summary, indent=2))
     return list(parameter_group_vars.values())
 
 

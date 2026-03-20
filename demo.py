@@ -12,7 +12,7 @@ Usage:
                             [--device DEVICE] [--vis_threshold VIS_THRESHOLD] [--output_dir OUT_DIR]
 
 Example:
-    python demo.py --model_path src/cut3r_512_dpt_4_64.pth \
+    python demo.py --model_path /home/hunn/projects/checkpoints/cut3r_512_dpt_4_64_bayes_decoder_init.pth \
         --seq_path examples/001 --device cuda --size 512
 """
 
@@ -43,8 +43,8 @@ def parse_args():
     parser.add_argument(
         "--model_path",
         type=str,
-        default="/home/hunn/checkpoints/cut3r_512_dpt_4_64.pth",
-        help="Path to the pretrained model checkpoint.",
+        default="/home/hunn/projects/checkpoints/cut3r_512_dpt_4_64_bayes_decoder_init.pth",
+        help="Path to the model checkpoint. Defaults to the bayesian decoder init checkpoint.",
     )
     parser.add_argument(
         "--seq_path",
@@ -399,6 +399,14 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True):
 
 
 def parse_seq_path(p, max_len=0):
+    if not os.path.isdir(p):
+        parent = os.path.dirname(os.path.normpath(p))
+        basename = os.path.basename(os.path.normpath(p))
+        if basename in {"images_2", "images_3"}:
+            corrected = os.path.join(parent, basename.replace("images_", "image_"))
+            if os.path.isdir(corrected):
+                p = corrected
+
     if os.path.isdir(p):
         def natural_sort_key(path):
             name = os.path.basename(path)
@@ -407,7 +415,23 @@ def parse_seq_path(p, max_len=0):
                 for part in re.split(r"(\d+)", name)
             ]
 
-        img_paths = sorted(glob.glob(f"{p}/*"), key=natural_sort_key)
+        image_root = p
+        kitti_camera_dirs = [
+            os.path.join(p, "image_2"),
+            os.path.join(p, "image_3"),
+            os.path.join(p, "images_2"),
+            os.path.join(p, "images_3"),
+        ]
+        for candidate in kitti_camera_dirs:
+            if os.path.isdir(candidate):
+                image_root = candidate
+                break
+
+        supported_extensions = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
+        img_paths = []
+        for pattern in supported_extensions:
+            img_paths.extend(glob.glob(os.path.join(image_root, pattern)))
+        img_paths = sorted(img_paths, key=natural_sort_key)
         if max_len > 0:
             img_paths = img_paths[:max_len]
         tmpdirname = None
