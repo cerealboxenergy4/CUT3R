@@ -137,6 +137,49 @@ def join_metric_path(*parts: str) -> str:
     return "/".join(part.strip("/") for part in parts if part)
 
 
+def split_top_level_terms(expr: str) -> list[str]:
+    terms = []
+    current = []
+    depth = 0
+    for char in expr:
+        if char == "(":
+            depth += 1
+        elif char == ")" and depth > 0:
+            depth -= 1
+        if char == "+" and depth == 0:
+            term = "".join(current).strip()
+            if term:
+                terms.append(term)
+            current = []
+            continue
+        current.append(char)
+    tail = "".join(current).strip()
+    if tail:
+        terms.append(tail)
+    return terms
+
+
+def build_criterion_expr(expr: str, use_rgb_loss: bool, split_name: str) -> str:
+    if use_rgb_loss:
+        return expr
+
+    filtered_terms = [
+        term for term in split_top_level_terms(expr) if not term.startswith("RGBLoss(")
+    ]
+    if not filtered_terms:
+        raise ValueError(
+            f"{split_name} criterion became empty after removing RGBLoss terms: {expr}"
+        )
+    filtered_expr = " + ".join(filtered_terms)
+    printer.info(
+        "RGB loss disabled for %s split. criterion: %s -> %s",
+        split_name,
+        expr,
+        filtered_expr,
+    )
+    return filtered_expr
+
+
 def build_logger(args, accelerator):
     if not accelerator.is_main_process:
         return None
@@ -304,12 +347,26 @@ def train(args):
         f"Decoder parameters: {sum(p.numel() for p in model.dec_blocks.parameters())}"
     )
 
-    printer.info(f">> Creating train criterion = {args.train_criterion}")
-    train_criterion = eval(args.train_criterion).to(device)
-    printer.info(
-        f">> Creating test criterion = {args.test_criterion or args.train_criterion}"
+    use_rgb_loss_default = bool(getattr(args, "use_rgb_loss", False))
+    train_use_rgb_loss = bool(
+        getattr(args, "train_use_rgb_loss", use_rgb_loss_default)
     )
-    test_criterion = eval(args.test_criterion or args.criterion).to(device)
+    test_use_rgb_loss = bool(
+        getattr(args, "test_use_rgb_loss", train_use_rgb_loss)
+    )
+    train_criterion_expr = build_criterion_expr(
+        args.train_criterion, train_use_rgb_loss, "train"
+    )
+    test_criterion_expr = build_criterion_expr(
+        args.test_criterion or args.train_criterion, test_use_rgb_loss, "test"
+    )
+
+    printer.info(f">> Creating train criterion = {train_criterion_expr}")
+    train_criterion = eval(train_criterion_expr).to(device)
+    printer.info(
+        f">> Creating test criterion = {test_criterion_expr}"
+    )
+    test_criterion = eval(test_criterion_expr).to(device)
 
     if args.pretrained and not args.resume:
         printer.info(f"Loading pretrained: {args.pretrained}")
